@@ -1,4 +1,4 @@
-name: Build Firmware
+name: Build M5Stack Cardputer ADV Firmware
 
 on:
   push:
@@ -13,6 +13,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -22,7 +23,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
 
       - name: Install system dependencies
         run: |
@@ -39,6 +39,88 @@ jobs:
           python3 -m pip install platformio
           pio --version
 
-      - name: Build firmware
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/cache
+          key: ${{ runner.os }}-pio-packages-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-packages-
+
+      - name: Cache PlatformIO build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .pio/buildcache
+            .pio/cache
+          key: ${{ runner.os }}-pio-build-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-pio-build-
+
+      - name: Build firmware (m5stack-cardputer-adv)
         run: |
           pio run -e m5stack-cardputer-adv
+
+      - name: Package firmware as zip
+        id: package
+        run: |
+          BUILD_DIR=".pio/build/m5stack-cardputer-adv"
+          FIRMWARE_BIN="$BUILD_DIR/firmware.bin"
+          if [ ! -f "$FIRMWARE_BIN" ]; then
+            echo "Firmware binary not found at $FIRMWARE_BIN"
+            exit 1
+          fi
+          ZIP_NAME="firmware-m5stack-cardputer-adv-${{ github.run_id }}.zip"
+          cd "$BUILD_DIR"
+          zip -r "/tmp/$ZIP_NAME" firmware.bin firmware.elf 2>/dev/null || zip "/tmp/$ZIP_NAME" firmware.bin
+          echo "zip_path=/tmp/$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo "firmware_size=$(stat -c%s "$FIRMWARE_BIN")" >> $GITHUB_OUTPUT
+
+      - name: Upload firmware zip as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-m5stack-cardputer-adv-zip
+          path: ${{ steps.package.outputs.zip_path }}
+          retention-days: 30
+
+      - name: Create GitHub release (main only)
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: firmware-m5stack-cardputer-adv-${{ github.run_id }}
+          name: "M5Stack Cardputer ADV Firmware (${{ github.run_id }})"
+          body: |
+            ## M5Stack Cardputer ADV Firmware
+
+            **Environment:** m5stack-cardputer-adv
+            **Build:** ${{ github.run_id }}
+            **Commit:** ${{ github.sha }}
+            **Size:** ${{ steps.package.outputs.firmware_size }} bytes
+
+            ### Features
+            - ST25R3916B NFC support (I2C Port A)
+            - MIFARE Classic 1K/4K/Mini read + diagnostics
+            - Darkside/nested key recovery (authorized keys only)
+            - MIFARE Classic diagnostic mode with per-block error classification
+            - Partial-read protection (never misrepresented as complete dump)
+
+            ### Installation
+            Flash with `esptool.py` or PlatformIO:
+            ```bash
+            esptool.py --port /dev/ttyUSB0 write_flash 0x0 firmware.bin
+            ```
+          files: ${{ steps.package.outputs.zip_path }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Print firmware info
+        run: |
+          echo "Firmware built successfully!"
+          echo "Environment: m5stack-cardputer-adv"
+          echo "Zip: ${{ steps.package.outputs.zip_path }}"
+          echo "Size: ${{ steps.package.outputs.firmware_size }} bytes"
