@@ -9,6 +9,14 @@
 #include <rfal_rfst25r3916.h>
 #include <vector>
 
+#if __has_include("../recovery-solver/src/modules/rfid/mfc_recovery.h")
+#include "../recovery-solver/src/modules/rfid/mfc_recovery.h"
+#elif __has_include("../../../../recovery-solver/src/modules/rfid/mfc_recovery.h")
+#include "../../../../recovery-solver/src/modules/rfid/mfc_recovery.h"
+#elif __has_include("mfc_recovery.h")
+#include "mfc_recovery.h"
+#endif
+
 class ST25R3916 : public RFIDInterface {
 public:
     enum CONNECTION_TYPE { SPI_MODE = 0, I2C_MODE = 1 };
@@ -41,6 +49,28 @@ public:
     }
     bool mfcReadBlock(uint8_t block, uint8_t data[16]) { return _mifareReadBlock(block, data); }
 
+    // MIFARE Classic recovery API
+    enum class RecoveryResult {
+        Verified,
+        AlreadyKnown,
+        NoTag,
+        Unsupported,
+        AuthenticationFailed,
+        UnstableNonce,
+        NotFound,
+        Cancelled,
+        NoMemory,
+        InternalError
+    };
+    static const char *recoveryStatus(RecoveryResult);
+
+    RecoveryResult recoverKey(uint8_t knownBlock, const uint8_t knownKey[6], bool knownB,
+                              uint8_t targetBlock, bool targetB, uint8_t recoveredKey[6],
+                              mfc_recovery::Progress progress = nullptr, void *context = nullptr);
+
+    // Discovery+UID parse+geometry only, NO dictionary scan.
+    bool selectMifareClassic(uint32_t timeoutMs = 5000);
+
     // Experimental key-recovery entry point; not validated on hardware.
     int recoverAllKeys();
 
@@ -71,6 +101,31 @@ public:
     String mfcType;                   // "Mini", "1K", "4K"
 
     bool isMifareClassicSak(uint8_t sak) const;
+
+    // MIFARE Classic recovery API
+    enum class RecoveryResult {
+        Verified,
+        AlreadyKnown,
+        NoTag,
+        Unsupported,
+        AuthenticationFailed,
+        UnstableNonce,
+        NotFound,
+        Cancelled,
+        NoMemory,
+        InternalError
+    };
+    static const char *recoveryStatus(RecoveryResult);
+
+    RecoveryResult recoverKey(uint8_t knownBlock, const uint8_t knownKey[6], bool knownB,
+                              uint8_t targetBlock, bool targetB, uint8_t recoveredKey[6],
+                              mfc_recovery::Progress progress = nullptr, void *context = nullptr);
+
+    // Discovery+UID parse+geometry only, NO dictionary scan.
+    bool selectMifareClassic(uint32_t timeoutMs = 5000);
+
+    // Experimental key-recovery entry point; not validated on hardware.
+    int recoverAllKeys();
 
 private:
     CONNECTION_TYPE _connection_type;
@@ -118,38 +173,6 @@ private:
     int _writeMifareClassicMagic(rfalNfcDevice *dev);  // clone to Magic Gen1
     void _mfcRebuildStrAllPages();
     int _saveMifareClassicFlipper(const String &filename);
-
-    // MIFARE Classic key recovery (Milestone 6 — Darkside / Nested Attack)
-    // Recovers unknown sector keys from nonce leakage during failed authentication.
-    // Requires only supplied known keys to bootstrap; no exhaustive 48-bit brute force.
-    struct MfcNonceSample {
-        uint32_t nt;           // card nonce captured during failed auth
-        uint8_t  block;        // block (trailer) that was being authenticated
-        bool     useKeyB;      // whether Key B was attempted
-    };
-    static constexpr int MFC_NONCE_MAX_SAMPLES = 256;
-
-    uint32_t _mfcRecoveredPrngState = 0; // recovered PRNG state for nonce prediction
-    MfcNonceSample _mfcNonces[MFC_NONCE_MAX_SAMPLES];
-    int _mfcNonceCount = 0;
-    uint8_t _mfcRecoveredKeyA[40][6]; // recovered Key A per sector
-    uint8_t _mfcRecoveredKeyB[40][6]; // recovered Key B per sector
-    bool _mfcKeyAFound[40] = {};      // which Key A were recovered
-    bool _mfcKeyBFound[40] = {};      // which Key B were recovered
-
-    // Capture a single card nonce (Nt) from a failed authentication to a trailer block.
-    bool _mfcCaptureNonceRaw(uint8_t block, const uint8_t key[6], bool useKeyB, uint32_t *ntOut);
-    // Darkside attack: collect nonces from failed authentications on a sector trailer.
-    int _mfcCollectNonces(rfalNfcDevice *dev, uint8_t block, bool useKeyB, int maxSamples);
-    // Recover PRNG state from collected nonces (brute-force 2^16 LFSR states).
-    bool _mfcRecoverPrngState(uint32_t *prngStateOut);
-    // Complete a nested authentication using a predicted nonce to recover the sector key.
-    bool _mfcRecoverKeyByNestedAuth(rfalNfcDevice *dev, uint8_t block, bool useKeyB,
-                                    const uint8_t knownKey[6], uint8_t recoveredKey[6]);
-    // Run darkside recovery on a single sector (Key A then Key B).
-    bool _mfcRecoverSectorKeys(rfalNfcDevice *dev, uint8_t sector, const uint8_t bootstrapKey[6]);
-    // Attempt full card key recovery: for each sector, try known keys, then darkside.
-    int _mfcRecoverAllKeys(rfalNfcDevice *dev);
 
     // helpers
     String _getNtagVariant();
