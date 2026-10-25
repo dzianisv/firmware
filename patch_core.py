@@ -178,7 +178,9 @@ def _patch_wire_cpp() -> None:
     # Wire.cpp. Declaring them here lets the compiler accept the calls;
     # if the ESP-IDF library still provides them (as deprecated wrappers),
     # the linker will resolve them.
-    if "i2cDeinit" not in content:
+    # Check for the declaration pattern, not just the string "i2cDeinit"
+    # (which appears in function calls throughout Wire.cpp).
+    if "int i2cDeinit(" not in content:
         lines = content.split("\n")
         insert_at = 0
         for idx, line in enumerate(lines):
