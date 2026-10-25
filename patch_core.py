@@ -36,7 +36,7 @@ def _read(path: str) -> str:
 
 
 def _write(path: str, content: str) -> None:
-    with open(path) as f:
+    with open(path, "w") as f:
         f.write(content)
 
 

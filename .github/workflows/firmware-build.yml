@@ -51,8 +51,8 @@ jobs:
 
       - name: Build firmware (m5stack-cardputer-adv)
         run: |
-          # Clean build to avoid stale objects from patched core files
-          pio run -e m5stack-cardputer-adv --clean || true
+          # Remove stale objects because the pre-build script patches cached core files.
+          rm -rf .pio/build/m5stack-cardputer-adv
           pio run -e m5stack-cardputer-adv
 
       - name: Package firmware as zip
