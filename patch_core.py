@@ -69,6 +69,7 @@ def _move_all_includes_outside_extern_c(content: str) -> str:
             brace_depth = line.count("{") - line.count("}")
             includes_inside: list[str] = []
             non_include_inside: list[str] = []
+            closing_line = "}"
 
             while i < n and brace_depth > 0:
                 inner_line = lines[i]
@@ -76,27 +77,21 @@ def _move_all_includes_outside_extern_c(content: str) -> str:
                 block_lines.append(inner_line)
                 brace_depth += inner_line.count("{") - inner_line.count("}")
 
+                if brace_depth <= 0:
+                    closing_line = inner_line
+                    break
+
                 if inner_stripped.startswith("#include"):
                     includes_inside.append(inner_line)
                 else:
                     non_include_inside.append(inner_line)
-
-                if brace_depth <= 0:
-                    break
                 i += 1
 
             # Emit includes BEFORE the extern "C" block
             new_lines.extend(includes_inside)
-            # Emit the extern "C" { opening line
             new_lines.append(line)
-            # Emit non-include content from inside the block
             new_lines.extend(non_include_inside)
-            # Emit the closing brace (last line of block if it's just "}")
-            if block_lines and block_lines[-1].strip() == "}":
-                new_lines.append("}")
-            else:
-                # The closing brace is on a separate line after the block content
-                new_lines.append("}")
+            new_lines.append(closing_line)
             i += 1
             continue
 
