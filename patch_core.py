@@ -5,13 +5,15 @@ Patches Arduino-ESP32 core framework files that are incompatible with
 GCC 14.x toolchains.
 
 Issues fixed:
-  1. #include <...> (C++ standard library) inside extern "C" blocks — GCC 14
-     rejects templates with C linkage. Move angle-bracket includes outside
-     the block; keep quoted ESP-IDF headers inside so their C types remain
-     visible to functions declared inside extern "C".
-  2. Esp.h: getCpuFrequencyMhz() renamed to getCpuFreqMHz()
-  3. Arduino.h: conflicting makeWord(uint8_t, uint8_t) overload
-  4. Wire.cpp: SDA/SCL default pin macros; missing I2C driver function
+  1. #include (...) inside extern "C" blocks — GCC 14 rejects C++ templates
+     with C linkage. ALL includes (quoted and angle-bracket) are moved
+     before the extern "C" block so templates are declared with C++ linkage.
+  2. Includes must be emitted BEFORE the extern "C" { opening line (not
+     before the closing }), otherwise types like esp_err_t are used before
+     they are declared.
+  3. Esp.h: getCpuFrequencyMhz() renamed to getCpuFreqMHz()
+  4. Arduino.h: conflicting makeWord(uint8_t, uint8_t) overload
+  5. Wire.cpp: SDA/SCL default pin macros; missing I2C driver function
      declarations (removed in ESP-IDF v5.x); missing <cstdint> for uint32_t
      / uint8_t types used in our forward declarations.
 """
@@ -24,7 +26,8 @@ FRAMEWORK_DIR = env.PioPlatform().get_package_dir("framework-arduinoespressif32"
 CORE_DIR = os.path.join(FRAMEWORK_DIR, "cores", "esp32")
 LIBS_DIR = os.path.join(FRAMEWORK_DIR, "libraries")
 
-# No PATCH_FLAG — patches are idempotent and safe to re-apply every build.
+# Headers to skip from auto-patching (handled manually or not needed)
+_SKIP_HEADERS = {"sdkconfig.h"}
 
 
 def _read(path: str) -> str:
@@ -33,53 +36,67 @@ def _read(path: str) -> str:
 
 
 def _write(path: str, content: str) -> None:
-    with open(path, "w") as f:
+    with open(path) as f:
         f.write(content)
 
 
-def _move_cpp_includes_outside_extern_c(content: str) -> str:
+def _move_all_includes_outside_extern_c(content: str) -> str:
     """
-    Move #include <...> (C++ standard library) directives that appear inside
-    an extern "C" block to before the block. Quoted #include "..." headers
-    (ESP-IDF drivers, soc, etc.) are left inside so their C types remain
-    visible to functions declared inside extern "C".
+    Move ALL #include directives (quoted and angle-bracket) that appear
+    inside an extern "C" block to before the block. This ensures C++ standard
+    library templates are declared with C++ linkage, avoiding GCC 14's
+    "template with C linkage" hard error.
+
+    Includes are emitted BEFORE the extern "C" { line so that types they
+    define (e.g. esp_err_t) are available to declarations inside the block.
     """
     lines = content.split("\n")
     new_lines: list[str] = []
     i = 0
-    in_extern_c = False
-    cpp_includes_inside: list[str] = []
-    brace_depth = 0
+    n = len(lines)
 
-    while i < len(lines):
+    while i < n:
         line = lines[i]
         stripped = line.strip()
 
-        if 'extern "C" {' in line and not in_extern_c:
-            in_extern_c = True
-            brace_depth = line.count("{") - line.count("}")
-            new_lines.append(line)
+        # Detect start of extern "C" block
+        starts_block = 'extern "C" {' in stripped
+
+        if starts_block:
+            # Collect all content inside the block until closing brace
+            block_lines = [line]
             i += 1
-            continue
+            brace_depth = line.count("{") - line.count("}")
+            includes_inside: list[str] = []
+            non_include_inside: list[str] = []
 
-        if in_extern_c:
-            brace_depth += line.count("{") - line.count("}")
-            if brace_depth <= 0 and stripped == "}":
-                # Emit all collected C++ includes before the closing brace
-                for inc in cpp_includes_inside:
-                    new_lines.append(inc)
-                cpp_includes_inside = []
-                in_extern_c = False
-                new_lines.append(line)
+            while i < n and brace_depth > 0:
+                inner_line = lines[i]
+                inner_stripped = inner_line.strip()
+                block_lines.append(inner_line)
+                brace_depth += inner_line.count("{") - inner_line.count("}")
+
+                if inner_stripped.startswith("#include"):
+                    includes_inside.append(inner_line)
+                else:
+                    non_include_inside.append(inner_line)
+
+                if brace_depth <= 0:
+                    break
                 i += 1
-                continue
 
-            if stripped.startswith('#include <'):
-                cpp_includes_inside.append(line)
-                i += 1
-                continue
-
+            # Emit includes BEFORE the extern "C" block
+            new_lines.extend(includes_inside)
+            # Emit the extern "C" { opening line
             new_lines.append(line)
+            # Emit non-include content from inside the block
+            new_lines.extend(non_include_inside)
+            # Emit the closing brace (last line of block if it's just "}")
+            if block_lines and block_lines[-1].strip() == "}":
+                new_lines.append("}")
+            else:
+                # The closing brace is on a separate line after the block content
+                new_lines.append("}")
             i += 1
             continue
 
@@ -90,8 +107,8 @@ def _move_cpp_includes_outside_extern_c(content: str) -> str:
 
 
 def _patch_all_hal_headers() -> None:
-    """Scan ALL .h files in cores/esp32 for extern "C" + C++ include conflicts,
-    not just a hardcoded list. This ensures we never miss a header."""
+    """Scan ALL .h files in cores/esp32 for extern "C" blocks containing
+    #include directives, and move those includes outside the block."""
     if not os.path.isdir(CORE_DIR):
         print(f"patch_core: CORE_DIR not found: {CORE_DIR}")
         return
@@ -100,16 +117,16 @@ def _patch_all_hal_headers() -> None:
     for fname in sorted(os.listdir(CORE_DIR)):
         if not fname.endswith(".h"):
             continue
-        path = os.path.join(CORE_DIR, fname)
-        # Skip ESP-IDF wrapper headers that are generated/included differently
-        if fname in ("sdkconfig.h",):
+        if fname in _SKIP_HEADERS:
             continue
+        path = os.path.join(CORE_DIR, fname)
         content = _read(path)
         if 'extern "C" {' not in content:
             continue
-        # Only patch if there's a #include <...> inside extern "C"
+        # Only patch if there's an #include inside extern "C"
+        # Quick check: does any line between extern "C" { and } start with #include?
         in_block = False
-        has_cpp_include_inside = False
+        has_include_inside = False
         for line in content.split("\n"):
             stripped = line.strip()
             if 'extern "C" {' in stripped:
@@ -118,18 +135,18 @@ def _patch_all_hal_headers() -> None:
             if in_block and stripped == "}":
                 in_block = False
                 continue
-            if in_block and stripped.startswith("#include <"):
-                has_cpp_include_inside = True
+            if in_block and stripped.startswith("#include"):
+                has_include_inside = True
                 break
 
-        if not has_cpp_include_inside:
+        if not has_include_inside:
             continue
 
-        new_content = _move_cpp_includes_outside_extern_c(content)
+        new_content = _move_all_includes_outside_extern_c(content)
         if new_content != content:
             _write(path, new_content)
             count += 1
-            print(f"patch_core: {fname} — moved C++ includes outside extern C")
+            print(f"patch_core: {fname} — moved includes outside extern C")
 
     print(f"patch_core: patched {count} HAL header(s)")
 
@@ -157,9 +174,24 @@ def _patch_arduino_h() -> None:
         content = content.replace("uint16_t makeWord(uint8_t h, uint8_t l);\n", "")
         modified = True
 
+    # Add <cstdlib> include before random() declarations to avoid conflicts
+    // with C library random() declarations when included inside extern "C"
+    if "long random(long);" in content and "#include <cstdlib>" not in content:
+        # Insert <cstdlib> near the top, after the include guard
+        lines = content.split("\n")
+        insert_at = 0
+        for idx, line in enumerate(lines):
+            if "#ifndef ARDUINO_H" in line or "#define ARDUINO_H" in line:
+                insert_at = idx + 2
+                break
+        if insert_at > 0:
+            lines.insert(insert_at, "#include <cstdlib>")
+            content = "\n".join(lines)
+            modified = True
+
     if modified:
         _write(path, content)
-        print("patch_core: Arduino.h — removed conflicting makeWord overload")
+        print("patch_core: Arduino.h — removed makeWord overload + added cstdlib")
 
 
 def _patch_wire_cpp() -> None:
@@ -201,8 +233,6 @@ def _patch_wire_cpp() -> None:
 
     # Add forward declarations for ESP-IDF I2C driver functions removed in
     # ESP-IDF v5.x but still referenced by Arduino-ESP32 3.3.9's Wire.cpp.
-    # Check for the declaration pattern, not just "i2cDeinit" (which appears
-    # in function calls throughout Wire.cpp).
     if "int i2cDeinit(" not in content:
         lines = content.split("\n")
         insert_at = 0
