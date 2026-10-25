@@ -45,13 +45,12 @@ jobs:
           path: |
             ~/.platformio/packages
             ~/.platformio/cache
-          key: ${{ runner.os }}-pio-packages-${{ hashFiles('platformio.ini') }}
-          restore-keys: |
-            ${{ runner.os }}-pio-packages-
+          # v2 prevents restoring core packages mutated by the removed patch script.
+          key: ${{ runner.os }}-pio-packages-v2-${{ hashFiles('platformio.ini') }}
 
       - name: Build firmware (m5stack-cardputer-adv)
         run: |
-          # Remove stale objects because the pre-build script patches cached core files.
+          # Start from a clean environment build directory.
           rm -rf .pio/build/m5stack-cardputer-adv
           pio run -e m5stack-cardputer-adv
 
