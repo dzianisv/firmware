@@ -1,4 +1,5 @@
 import hashlib
+import os
 from typing import TYPE_CHECKING, Any
 import requests
 
@@ -8,55 +9,58 @@ if TYPE_CHECKING:
 
 import glob
 import gzip
-from os import makedirs, remove, rename
+from os import makedirs, remove, replace
 from os.path import basename, dirname, exists, isfile, join
+from shutil import copyfile
 
 Import("env")  # type: ignore
 
 FRAMEWORK_DIR = env.PioPlatform().get_package_dir("framework-arduinoespressif32-libs")
 board_mcu = env.BoardConfig()
 mcu = board_mcu.get("build.mcu", "")
-patchflag_path = join(FRAMEWORK_DIR,mcu, "lib", ".patched")
+patchflag_path = join(FRAMEWORK_DIR, mcu, "lib", ".patched")
 
-# patch file only if we didn't do it befored
-if not isfile(join(FRAMEWORK_DIR,mcu, "lib", ".patched")):
-    original_file = join(FRAMEWORK_DIR,mcu, "lib", "libnet80211.a")
-    patched_file = join(
-        FRAMEWORK_DIR, mcu, "lib", "libnet80211.a.patched"
-    )
+if mcu != "esp32p4":
+    original_file = join(FRAMEWORK_DIR, mcu, "lib", "libnet80211.a")
+    patched_file = original_file + ".patched"
+    backup_file = original_file + ".old"
 
-    if mcu=="esp32c5" or mcu=="esp32c6" :
-        env.Execute(
-            "pio pkg exec -p toolchain-riscv32-esp -- riscv32-esp-elf-objcopy  --weaken-symbol=ieee80211_raw_frame_sanity_check %s %s"
-            % (original_file, patched_file)
+    # Older versions renamed the archive even when objcopy failed, then wrote
+    # the success marker. Repair that state without losing the original archive.
+    if not isfile(original_file) and isfile(backup_file):
+        copyfile(backup_file, original_file)
+        if isfile(patchflag_path):
+            remove(patchflag_path)
+    if not isfile(original_file):
+        raise RuntimeError("Wi-Fi archive missing: " + original_file)
+
+    if not isfile(patchflag_path):
+        # Use the selected toolchain, including pioarduino's unified GCC package.
+        # The old toolchain-xtensa-esp32s3 package name no longer exists.
+        # This pre-script runs before SCons configures $OBJCOPY.
+        if mcu in ("esp32", "esp32s2", "esp32s3"):
+            package = "toolchain-xtensa-esp-elf"
+            executable = "xtensa-esp-elf-objcopy"
+        else:
+            package = "toolchain-riscv32-esp"
+            executable = "riscv32-esp-elf-objcopy"
+        toolchain_dir = env.PioPlatform().get_package_dir(package)
+        if not toolchain_dir:
+            raise RuntimeError("Missing toolchain package: " + package)
+        objcopy = join(toolchain_dir, "bin", executable + (".exe" if os.name == "nt" else ""))
+        if isfile(patched_file):
+            remove(patched_file)
+        result = env.Execute(
+            '"%s" --weaken-symbol=ieee80211_raw_frame_sanity_check "%s" "%s"'
+            % (objcopy, original_file, patched_file)
         )
-    elif mcu=="esp32p4":
-        """Do nothing"""
-    else:
-        env.Execute(
-            "pio pkg exec -p toolchain-xtensa-%s -- xtensa-%s-elf-objcopy  --weaken-symbol=ieee80211_raw_frame_sanity_check %s %s"
-            % (mcu, mcu, original_file, patched_file)
-        )
-
-    if isfile("%s.old" % (original_file)):
-        remove("%s.old" % (original_file))
-
-    if isfile(original_file):
-        rename(original_file, "%s.old" % (original_file))
-    else:
-        print("Patch: Original file not found")
-
-    if isfile(patched_file):
-        rename(patched_file, original_file)
-    else:
-        print("Patch: Patched file not found")
-
-
-    def _touch(path):
-        with open(path, "w") as fp:
-            fp.write("")
-
-    env.Execute(lambda *args, **kwargs: _touch(patchflag_path))
+        if result != 0 or not isfile(patched_file):
+            raise RuntimeError("Wi-Fi archive patch failed; original left intact")
+        if not isfile(backup_file):
+            copyfile(original_file, backup_file)
+        replace(patched_file, original_file)
+        with open(patchflag_path, "w") as fp:
+            fp.write("objcopy patch completed\n")
 
 
 def hash_file(file_path):

@@ -75,6 +75,7 @@ private:
     uint16_t _diagBlocksOk = 0;
     uint16_t _diagBlocksFail = 0;
     uint8_t _diagErrorClass = 0; // 0=auth,1=timeout,2=RF,3=unsupported,4=internal
+    bool _diagReady = false;
     bool _diagRunning = false;
     bool _diagCancel = false;
 

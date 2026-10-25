@@ -98,7 +98,8 @@ void TagOMatic::loop() {
             break;
         }
 
-        if (check(SelPress)) { select_state(); }
+        // Diagnostic mode handles SEL itself (start/results).
+        if (current_state != DIAG_MODE && check(SelPress)) { select_state(); }
 
         switch (current_state) {
             case READ_MODE: read_card(); break;
@@ -137,9 +138,11 @@ void TagOMatic::select_state() {
     }
     options.emplace_back("Write NDEF", [this]() { set_state(WRITE_NDEF_MODE); });
     options.emplace_back("Erase tag", [this]() { set_state(ERASE_MODE); });
+#if !defined(LITE_VERSION)
     if (bruceConfigPins.rfidModule == ST25R3916_SPI_MODULE || bruceConfigPins.rfidModule == ST25R3916_I2C_MODULE) {
         options.emplace_back("MFC Diagnostics", [this]() { set_state(DIAG_MODE); });
     }
+#endif
 
     loopOptions(options);
 }
@@ -214,6 +217,7 @@ void TagOMatic::set_state(RFID_State state) {
             _diagBlocksOk = 0;
             _diagBlocksFail = 0;
             _diagErrorClass = 0;
+            _diagReady = false;
             _diagRunning = false;
             _diagCancel = false;
             padprintln("MIFARE Classic Diagnostics");
@@ -241,6 +245,7 @@ void TagOMatic::display_banner() {
         case EMULATE_MODE: printSubtitle("EMULATE MODE"); break;
         case EMULATE_NDEF_MODE: printSubtitle("EMULATE NDEF MODE"); break;
         case SAVE_MODE: printSubtitle("SAVE MODE"); break;
+        case DIAG_MODE: printSubtitle("MFC DIAGNOSTICS"); break;
     }
 
     tft.setTextSize(FP);
@@ -713,6 +718,8 @@ void TagOMatic::load_file() {
 // error classification, block counts. Supports cancellation and optional
 // darkside key recovery.
 
+#if !defined(LITE_VERSION)
+namespace {
 const char *_diagErrorClassStr(uint8_t cls) {
     switch (cls) {
         case 0: return "Authentication";
@@ -723,6 +730,7 @@ const char *_diagErrorClassStr(uint8_t cls) {
         default: return "Unknown";
     }
 }
+} // namespace
 
 void TagOMatic::diag_card() {
     // ST25R3916 driver needed for MIFARE Classic diagnostics.
@@ -734,8 +742,8 @@ void TagOMatic::diag_card() {
     }
     ST25R3916 *st25r = static_cast<ST25R3916 *>(_rfid);
 
-    if (!_diagRunning) {
-        // Wait for card to be present.
+    if (!_diagRunning && !_diagReady) {
+        // Detect/read only once; don't repeat a full dump while waiting for SEL.
         int readStatus = _rfid->read();
         if (readStatus != RFIDInterface::SUCCESS) {
             if (check(EscPress)) {
@@ -765,17 +773,20 @@ void TagOMatic::diag_card() {
         padprintln("Press [SEL] to start reading.");
         padprintln("Press [ESC] to cancel.");
 
-        if (check(SelPress)) {
-            _diagRunning = true;
-            _diagSector = 0;
-            _diagBlock = 0;
-            _diagBlocksOk = 0;
-            _diagBlocksFail = 0;
-            _diagErrorClass = 0;
-            _diagCancel = false;
-        }
-        delayWithReturn(200);
+        _diagReady = true;
         return;
+    }
+
+    if (!_diagRunning) {
+        if (!check(SelPress)) return;
+        if (!st25r->mfcReselect()) {
+            displayError("Card missing or changed.", true);
+            set_state(READ_MODE);
+            return;
+        }
+        _diagRunning = true;
+        _rfid->pageReadSuccess = false;
+        _rfid->pageReadStatus = RFIDInterface::FAILURE;
     }
 
     // Diagnostic run in progress.
@@ -802,7 +813,11 @@ void TagOMatic::diag_card() {
         padprintln(String("Sectors: ") + String(st25r->mfcDump.sectors));
         padprintln(String("Blocks OK: ") + String(_diagBlocksOk) + "/" + String(st25r->mfcDump.totalBlocks));
         padprintln(String("Blocks FAIL: ") + String(_diagBlocksFail));
-        if (_diagBlocksFail == 0) {
+        const bool complete = st25r->mfcDump.totalBlocks > 0 &&
+                              _diagBlocksOk == st25r->mfcDump.totalBlocks && _diagBlocksFail == 0;
+        _rfid->pageReadSuccess = complete;
+        _rfid->pageReadStatus = complete ? RFIDInterface::SUCCESS : RFIDInterface::FAILURE;
+        if (complete) {
             padprintln("Complete dump.");
         } else {
             padprintln("Partial data — not a complete dump.");
@@ -821,8 +836,8 @@ void TagOMatic::diag_card() {
     }
 
     // Read current sector.
-    uint8_t firstBlock = st25r->_mfcSectorFirstBlock(sector);
-    uint8_t nBlocks = st25r->_mfcSectorBlockCount(sector);
+    uint8_t firstBlock = st25r->mfcSectorFirstBlock(sector);
+    uint8_t nBlocks = st25r->mfcSectorBlockCount(sector);
     uint8_t trailer = (uint8_t)(firstBlock + nBlocks - 1);
 
     // Try authentication with known keys (Key A then Key B).
@@ -833,7 +848,7 @@ void TagOMatic::diag_card() {
     const int nKeys = (int)(sizeof(st25r->keys) / sizeof(st25r->keys[0]));
     for (int useB = 0; useB <= 1 && !authOk; useB++) {
         for (int kidx = 0; kidx < nKeys; kidx++) {
-            if (st25r->_mifareAuth(trailer, st25r->keys[kidx], useB != 0)) {
+            if (st25r->mfcAuthenticate(trailer, st25r->keys[kidx], useB != 0)) {
                 authOk = true;
                 usedKeyB = (useB != 0);
                 memcpy(usedKey, st25r->keys[kidx], 6);
@@ -841,19 +856,14 @@ void TagOMatic::diag_card() {
             }
             // Failed auth — classify error.
             _diagErrorClass = 0; // Authentication
-            st25r->_mfcHalt();
-            st25r->nfcDeactivate(false);
-            delay(5);
-            rfalNfcDevice *d2 = nullptr;
-            if (!st25r->pollForTag(&d2, 500)) {
-                _diagErrorClass = 1; // Timeout
-                _diagBlocksFail++;
-                _diagBlock++;
-                if (_diagBlock >= nBlocks) { _diagBlock = 0; _diagSector++; }
+            if (!st25r->mfcReselect()) {
+                _diagErrorClass = 1; // Timeout or card replaced
+                _diagBlocksFail += nBlocks;
+                _diagBlock = 0;
+                _diagSector++;
+                diag_displaySector(sector, block, false, false, "Timeout");
                 return;
             }
-            st25r->_parseDevice(d2);
-            st25r->_mfcAuthed = false;
         }
     }
 
@@ -864,26 +874,21 @@ void TagOMatic::diag_card() {
                 uint8_t k[6];
                 for (int i = 0; i < 6; i++)
                     k[i] = (uint8_t)strtoul(mifKey.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
-                if (st25r->_mifareAuth(trailer, k, useB != 0)) {
+                if (st25r->mfcAuthenticate(trailer, k, useB != 0)) {
                     authOk = true;
                     usedKeyB = (useB != 0);
                     memcpy(usedKey, k, 6);
                     break;
                 }
                 _diagErrorClass = 0; // Authentication
-                st25r->_mfcHalt();
-                st25r->nfcDeactivate(false);
-                delay(5);
-                rfalNfcDevice *d2 = nullptr;
-                if (!st25r->pollForTag(&d2, 500)) {
-                    _diagErrorClass = 1; // Timeout
-                    _diagBlocksFail++;
-                    _diagBlock++;
-                    if (_diagBlock >= nBlocks) { _diagBlock = 0; _diagSector++; }
+                if (!st25r->mfcReselect()) {
+                    _diagErrorClass = 1; // Timeout or card replaced
+                    _diagBlocksFail += nBlocks;
+                    _diagBlock = 0;
+                    _diagSector++;
+                    diag_displaySector(sector, block, false, false, "Timeout");
                     return;
                 }
-                st25r->_parseDevice(d2);
-                st25r->_mfcAuthed = false;
             }
         }
     }
@@ -893,20 +898,20 @@ void TagOMatic::diag_card() {
         _diagErrorClass = 0;
         _diagBlocksFail += nBlocks;
         diag_displaySector(sector, block, false, false, "Authentication");
-        _diagBlock++;
-        if (_diagBlock >= nBlocks) { _diagBlock = 0; _diagSector++; }
-        // Re-select card for next sector.
-        st25r->_mfcHalt();
-        st25r->nfcDeactivate(false);
-        delay(5);
-        rfalNfcDevice *d2 = nullptr;
-        if (!st25r->pollForTag(&d2, 500)) {
-            _diagErrorClass = 1;
-            return;
-        }
-        st25r->_parseDevice(d2);
-        st25r->_mfcAuthed = false;
+        _diagBlock = 0;
+        _diagSector++;
+        // Count a failed sector once, not once per block.
+        if (!st25r->mfcReselect()) _diagErrorClass = 1;
         return;
+    }
+
+    // Use the same public key table as normal reads and saved dumps.
+    if (usedKeyB) {
+        memcpy(st25r->mfcDump.keyB[sector], usedKey, 6);
+        st25r->mfcDump.keyBFound[sector] = true;
+    } else {
+        memcpy(st25r->mfcDump.keyA[sector], usedKey, 6);
+        st25r->mfcDump.keyAFound[sector] = true;
     }
 
     // Auth succeeded — read blocks in this sector.
@@ -919,11 +924,13 @@ void TagOMatic::diag_card() {
             return;
         }
 
-        bool readOk = st25r->_mifareReadBlock(blk, data);
+        bool readOk = st25r->mfcReadBlock(blk, data);
         _diagBlock = bo;
         _diagSector = sector;
 
         if (readOk) {
+            memcpy(st25r->mfcDump.blocks[blk], data, 16);
+            st25r->mfcDump.blockRead[blk] = true;
             _diagBlocksOk++;
             _diagErrorClass = 0; // no error
             diag_displaySector(sector, bo, true, true, nullptr);
@@ -942,16 +949,9 @@ void TagOMatic::diag_card() {
     _diagSector++;
 
     // Re-select card for next sector.
-    st25r->_mfcHalt();
-    st25r->nfcDeactivate(false);
-    delay(5);
-    rfalNfcDevice *d2 = nullptr;
-    if (!st25r->pollForTag(&d2, 500)) {
+    if (_diagSector < st25r->mfcDump.sectors && !st25r->mfcReselect()) {
         _diagErrorClass = 1; // Timeout
-        return;
     }
-    st25r->_parseDevice(d2);
-    st25r->_mfcAuthed = false;
 }
 
 void TagOMatic::diag_displaySector(uint8_t sector, uint8_t block, bool authOk, bool readOk, const char *error) {
@@ -1048,18 +1048,13 @@ void TagOMatic::diag_printKeyTable() {
 
     int count = 0;
     for (uint8_t s = 0; s < st25r->mfcDump.sectors; s++) {
-        if (st25r->_mfcKeyAFound[s]) {
-            padprintln(String("S") + String(s) + " A: " +
-                String(st25r->_mfcRecoveredKeyA[s][0], HEX) + String(st25r->_mfcRecoveredKeyA[s][1], HEX) +
-                String(st25r->_mfcRecoveredKeyA[s][2], HEX) + String(st25r->_mfcRecoveredKeyA[s][3], HEX) +
-                String(st25r->_mfcRecoveredKeyA[s][4], HEX) + String(st25r->_mfcRecoveredKeyA[s][5], HEX));
-            count++;
-        }
-        if (st25r->_mfcKeyBFound[s]) {
-            padprintln(String("S") + String(s) + " B: " +
-                String(st25r->_mfcRecoveredKeyB[s][0], HEX) + String(st25r->_mfcRecoveredKeyB[s][1], HEX) +
-                String(st25r->_mfcRecoveredKeyB[s][2], HEX) + String(st25r->_mfcRecoveredKeyB[s][3], HEX) +
-                String(st25r->_mfcRecoveredKeyB[s][4], HEX) + String(st25r->_mfcRecoveredKeyB[s][5], HEX));
+        for (int useB = 0; useB <= 1; useB++) {
+            if (!(useB ? st25r->mfcDump.keyBFound[s] : st25r->mfcDump.keyAFound[s])) continue;
+            const uint8_t *key = useB ? st25r->mfcDump.keyB[s] : st25r->mfcDump.keyA[s];
+            char line[40];
+            snprintf(line, sizeof(line), "S%u %c: %02X%02X%02X%02X%02X%02X", s, useB ? 'B' : 'A',
+                     key[0], key[1], key[2], key[3], key[4], key[5]);
+            padprintln(String(line));
             count++;
         }
     }
@@ -1074,6 +1069,16 @@ void TagOMatic::diag_printKeyTable() {
     }
     set_state(READ_MODE);
 }
+
+#else
+void TagOMatic::diag_card() {
+    displayError("Diagnostics require a full build.", true);
+    set_state(READ_MODE);
+}
+void TagOMatic::diag_displaySector(uint8_t, uint8_t, bool, bool, const char *) {}
+void TagOMatic::diag_recoverKeys() {}
+void TagOMatic::diag_printKeyTable() {}
+#endif // !LITE_VERSION
 
 void TagOMatic::save_file() {
     String uid_str = _rfid->printableUID.uid;

@@ -32,13 +32,16 @@ public:
 
     void stopDiscovery();
 
-    // Public wrappers for diagnostic mode (Tag-O-Matic DIAG_MODE).
-    // These expose private RFAL members needed for per-sector re-selection
-    // during MIFARE Classic diagnostics and key recovery.
-    void nfcDeactivate(bool b = false);
-    bool pollForTag(rfalNfcDevice **dev, uint32_t timeoutMs = 5000);
+    // Diagnostic operations keep RFAL and cipher state inside the driver.
+    bool mfcReselect(uint32_t timeoutMs = 500);
+    uint8_t mfcSectorFirstBlock(uint8_t sector) const { return _mfcSectorFirstBlock(sector); }
+    uint8_t mfcSectorBlockCount(uint8_t sector) const { return _mfcSectorBlockCount(sector); }
+    bool mfcAuthenticate(uint8_t block, const uint8_t key[6], bool useKeyB) {
+        return _mifareAuth(block, key, useKeyB);
+    }
+    bool mfcReadBlock(uint8_t block, uint8_t data[16]) { return _mifareReadBlock(block, data); }
 
-    // Public entry point for full-card darkside key recovery.
+    // Experimental key-recovery entry point; not validated on hardware.
     int recoverAllKeys();
 
     // Milestone 1 — advanced NFC-A info (NTAG / Ultralight)
@@ -63,7 +66,7 @@ public:
         uint8_t sectors;              // 5 (Mini), 16 (1K), 40 (4K)
         uint16_t totalBlocks;         // 20, 64 or 256
     };
-    MifareClassicDump mfcDump;
+    MifareClassicDump mfcDump = {};
     bool mfcLoaded = false;           // true when mfcDump holds a valid MIFARE Classic dump
     String mfcType;                   // "Mini", "1K", "4K"
 
@@ -131,8 +134,8 @@ private:
     int _mfcNonceCount = 0;
     uint8_t _mfcRecoveredKeyA[40][6]; // recovered Key A per sector
     uint8_t _mfcRecoveredKeyB[40][6]; // recovered Key B per sector
-    bool _mfcKeyAFound[40];           // which Key A were recovered
-    bool _mfcKeyBFound[40];           // which Key B were recovered
+    bool _mfcKeyAFound[40] = {};      // which Key A were recovered
+    bool _mfcKeyBFound[40] = {};      // which Key B were recovered
 
     // Capture a single card nonce (Nt) from a failed authentication to a trailer block.
     bool _mfcCaptureNonceRaw(uint8_t block, const uint8_t key[6], bool useKeyB, uint32_t *ntOut);

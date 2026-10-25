@@ -14,6 +14,8 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -33,42 +35,70 @@ jobs:
             libssl-dev libffi-dev libusb-1.0-0-dev \
             unzip zip
 
+      - name: Test Wi-Fi archive patch safety
+        run: python3 -m unittest discover -s tests -p 'test_wifi_archive_patch.py' -v
+
       - name: Install PlatformIO
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install platformio
           pio --version
 
-      - name: Cache PlatformIO packages
-        uses: actions/cache@v4
+      - name: Restore PlatformIO cache
+        id: pio-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.platformio/packages
-            ~/.platformio/cache
-          # v2 prevents restoring core packages mutated by the removed patch script.
-          key: ${{ runner.os }}-pio-packages-v2-${{ hashFiles('platformio.ini') }}
+            ~/.platformio/platforms
+            .pio/cache
+            .pio/libdeps
+            .pio/buildcache
+          # v3 excludes all caches created by the removed core patch script.
+          key: ${{ runner.os }}-cardputer-pio-v3-${{ hashFiles('platformio.ini', 'boards/**/*.ini', 'patch*.py') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-cardputer-pio-v3-${{ hashFiles('platformio.ini', 'boards/**/*.ini', 'patch*.py') }}-
 
       - name: Build firmware (m5stack-cardputer-adv)
-        run: |
-          # Start from a clean environment build directory.
-          rm -rf .pio/build/m5stack-cardputer-adv
-          pio run -e m5stack-cardputer-adv
+        run: pio run -e m5stack-cardputer-adv
+
+      - name: Save PlatformIO cache (including failed builds)
+        if: ${{ always() && !cancelled() && steps.pio-cache.outcome == 'success' && steps.pio-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            .pio/cache
+            .pio/libdeps
+            .pio/buildcache
+          key: ${{ steps.pio-cache.outputs.cache-primary-key }}
 
       - name: Package firmware as zip
         id: package
         run: |
-          BUILD_DIR=".pio/build/m5stack-cardputer-adv"
-          FIRMWARE_BIN="$BUILD_DIR/firmware.bin"
-          if [ ! -f "$FIRMWARE_BIN" ]; then
-            echo "Firmware binary not found at $FIRMWARE_BIN"
+          # build.py creates a merged image (bootloader + partitions + app).
+          # The raw .pio firmware.bin is app-only and cannot be flashed at 0x0.
+          MERGED_BIN="Bruce-m5stack-cardputer-adv.bin"
+          if [ ! -s "$MERGED_BIN" ]; then
+            echo "Merged firmware not found at $MERGED_BIN"
             exit 1
           fi
+          PACKAGE_DIR="$(mktemp -d)"
+          cp "$MERGED_BIN" "$PACKAGE_DIR/firmware.bin"
+          FIRMWARE_SIZE="$(stat -c%s "$PACKAGE_DIR/firmware.bin")"
           ZIP_NAME="firmware-m5stack-cardputer-adv-${{ github.run_id }}.zip"
-          cd "$BUILD_DIR"
-          zip -r "/tmp/$ZIP_NAME" firmware.bin firmware.elf 2>/dev/null || zip "/tmp/$ZIP_NAME" firmware.bin
-          echo "zip_path=/tmp/$ZIP_NAME" >> $GITHUB_OUTPUT
-          echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
-          echo "firmware_size=$(stat -c%s "$FIRMWARE_BIN")" >> $GITHUB_OUTPUT
+          (
+            cd "$PACKAGE_DIR"
+            sha256sum firmware.bin > SHA256SUMS
+            zip "/tmp/$ZIP_NAME" firmware.bin SHA256SUMS
+          )
+          unzip -t "/tmp/$ZIP_NAME"
+          {
+            echo "zip_path=/tmp/$ZIP_NAME"
+            echo "zip_name=$ZIP_NAME"
+            echo "firmware_size=$FIRMWARE_SIZE"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upload firmware zip as build artifact
         uses: actions/upload-artifact@v4
@@ -94,7 +124,8 @@ jobs:
             ### Features
             - ST25R3916B NFC support (I2C Port A)
             - MIFARE Classic 1K/4K/Mini read + diagnostics
-            - Darkside/nested key recovery (authorized keys only)
+            - Known-key checks and experimental recovery scaffolding (not a complete darkside implementation)
+            - Hardware behavior has not been validated
             - MIFARE Classic diagnostic mode with per-block error classification
             - Partial-read protection (never misrepresented as complete dump)
 
@@ -105,7 +136,7 @@ jobs:
             ```
           files: ${{ steps.package.outputs.zip_path }}
           draft: false
-          prerelease: false
+          prerelease: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

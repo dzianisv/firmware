@@ -23,23 +23,23 @@ None of these tests could be executed without hardware.
 
 ## Key Recovery Limitations
 
-### Darkside attack scope
+### Darkside recovery is not implemented completely
 
-The implemented darkside/nested attack:
+The current code contains experimental nonce-collection and PRNG-search scaffolding, not a working port of darkside or nested key recovery. It does not implement the Crypto1 state recovery needed to derive an unknown sector key. Predicting a nonce does not prove knowledge of a key.
 
-1. **Requires a bootstrap sector** — at least one sector (typically sector 0) must be readable with a known key (e.g. `FFFFFFFFFFFF`) to bootstrap the nested authentication
-2. **Same-key scenario** — the nested attack recovers the target sector's key when it uses the **same key** as the bootstrap sector. For sectors with different keys, the full hardnested attack (bit-by-bit key recovery) is not implemented
-3. **No 48-bit brute force** — only the 2^16 PRNG state space is searched. Exhaustive 48-bit key brute force is explicitly not claimed as practical on the ESP32-S3
+- Built-in and user-supplied keys are checked by authentication.
+- The experimental path only tests an already-known bootstrap key; any candidate must pass full authentication before being marked found.
+- Darkside and nested are different attacks. A known bootstrap sector is a nested-attack requirement, not a general darkside requirement.
+- Nonce timing, RF exchanges and all key checks remain untested on physical hardware.
 
-### Key recovery success conditions
+### Current scope
 
-| Scenario | Key Recovery Works? |
-|----------|---------------------|
-| Sector uses default key `FFFFFFFFFFFF` | Yes (dictionary attack) |
-| Sector uses a known custom key | Yes (dictionary attack) |
-| All sectors use same key, sector 0 known | Yes (nested same-key attack) |
-| Sector uses unknown unique key | No (requires hardnested attack, not implemented) |
-| Sector 0 uses unknown key | No (no bootstrap sector available) |
+| Scenario | Implementation status |
+|----------|-----------------------|
+| Sector uses default key `FFFFFFFFFFFF` | Dictionary authentication implemented; hardware untested |
+| Sector uses a supplied custom key | Dictionary authentication implemented; hardware untested |
+| Sector uses an unknown key | Unknown-key recovery not implemented |
+| Nonce prediction matches | Not sufficient evidence of a recovered key |
 
 ## Diagnostic Mode Limitations
 
@@ -63,7 +63,7 @@ The implemented darkside/nested attack:
 
 - `delayWithReturn(50)` between block reads keeps the UI responsive
 - `EscPress` is checked between blocks and between sectors
-- Cancellation is supported at any point
+- The initial normal read and authentication/key-search loops are still blocking; cancellation is not guaranteed during those operations
 
 ## Code Review Notes
 
@@ -74,8 +74,8 @@ The implemented darkside/nested attack:
 ### Memory usage
 
 - `MfcNonceSample[256]` array: ~3KB (256 × (4+1+1+padding))
-- `MifareClassicDump`: ~16KB (blocks[256][16] + key arrays)
-- Total additional RAM: ~20KB — acceptable on ESP32-S3 with 320KB+ SRAM
+- `MifareClassicDump`: about 5KB (4KB blocks plus keys and flags)
+- These structures do not include the driver's emulation buffers or dynamic allocations; actual RAM use must be checked in build output
 
 ### RFAL fork dependency
 
@@ -104,7 +104,7 @@ These are already used by Bruce's existing ST25R3916 driver — no new dependenc
 ## Future Work
 
 1. **Hardware validation** — Test on actual Cardputer ADV with ST25R3916B
-2. **Hardnested attack** — Implement bit-by-bit key recovery for sectors with unique unknown keys
+2. **Real darkside port** — Port a licensed upstream implementation, test against known capture/key vectors, then validate ST25R3916 raw exchanges on hardware
 3. **I2C bus contention testing** — Verify ST25R3916B coexists with TCA8418 on shared Port A
 4. **Serial diagnostics with redaction** — Add optional serial output with key redaction (currently keys are not printed to serial at all)
 5. **Test card matrix** — Validate against all card types listed in Phase 5 of the task

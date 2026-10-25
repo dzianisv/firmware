@@ -12,13 +12,16 @@
 From the Bruce firmware repository root:
 
 ```bash
-# Build for Cardputer ADV (includes ST25R3916 I2C + MIFARE Classic diagnostics + key recovery)
+# Build for Cardputer ADV (ST25R3916 I2C + MIFARE Classic diagnostics)
 pio run -e m5stack-cardputer-adv
 ```
 
 The build produces:
-- `.pio/build/m5stack-cardputer-adv/firmware.bin` — full firmware binary
+- `Bruce-m5stack-cardputer-adv.bin` — merged bootloader + partition table + application; flash at `0x0`
+- `.pio/build/m5stack-cardputer-adv/firmware.bin` — application only; not suitable for flashing at `0x0`
 - `.pio/build/m5stack-cardputer-adv/firmware.elf` — ELF with debug symbols
+
+The CI ZIP renames the merged image to `firmware.bin` and includes `SHA256SUMS`. Builds have not been tested on a physical Cardputer ADV.
 
 ### Build environments available
 
@@ -99,29 +102,13 @@ On the Cardputer ADV device:
 | Error: Authentication / Timeout / RF Communication / Unsupported / Internal | Error classification |
 | Partial — incomplete dump | Shown when not all blocks were read |
 
-## 5. Key Recovery (Darkside Attack)
+## 5. Known-Key Checks and Experimental Recovery
 
-Key recovery is available from the diagnostic screen:
+After diagnostics, press **[SEL]** to display keys that passed authentication. The reader tries built-in default keys and configured custom keys.
 
-1. After a diagnostic read (complete or partial), press **[SEL]** to show recovered keys
-2. Or navigate to **MFC Diagnostics** → the key recovery option runs automatically on all sectors
-3. Recovered keys are displayed as:
-   ```
-   S03 A: FFFFFFFFFFFF
-   S07 B: A0A1A2A3A4A5
-   Total: 2 keys recovered
-   ```
+**This is not a complete darkside or nested key-recovery implementation.** The experimental fallback collects nonces and searches PRNG states, but does not derive unknown Crypto1 keys. A predicted nonce alone cannot establish that a key was recovered; a candidate must pass full authentication.
 
-### How key recovery works
-
-1. **Dictionary attack**: Tries built-in default keys (including `FFFFFFFFFFFF`) and custom keys from `/BruceRFID/keys.conf`
-2. **Darkside (nested) attack**: For sectors where no dictionary key works:
-   - Collects card nonces (Nt) from failed authentication attempts — the MIFARE Classic protocol leaks Nt before key verification
-   - Recovers the weak 16-bit PRNG state by brute-forcing 2^16 LFSR initial states
-   - Predicts the next nonce and performs a nested authentication from a bootstrapped sector (sector 0 with known key)
-   - If the target sector uses the same key as the bootstrap sector, the key is recovered
-
-**No exhaustive 48-bit brute force is performed.** Only the 2^16 PRNG state space is searched, which is trivial on the ESP32-S3.
+There is currently no separate key-recovery menu item. Unknown-key recovery requires a real upstream port and tests with known capture/key vectors. See `CARDPUTER_ADV_LIMITATIONS.md` for the unverified hardware behavior and cancellation limits.
 
 ## 6. Rollback to Previous Firmware
 

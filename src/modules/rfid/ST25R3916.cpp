@@ -296,15 +296,28 @@ void ST25R3916::stopDiscovery() {
     }
 }
 
-void ST25R3916::nfcDeactivate(bool b) {
-    if (_nfc) _nfc->rfalNfcDeactivate(b);
-}
+bool ST25R3916::mfcReselect(uint32_t timeoutMs) {
+    if (!_nfc || !_hw) return false;
+    _mfcHalt();
+    _nfc->rfalNfcDeactivate(false);
+    _discoveryStarted = false;
+    delay(5);
 
-bool ST25R3916::pollForTag(rfalNfcDevice **dev, uint32_t timeoutMs) {
-    return _pollForTag(dev, timeoutMs);
+    rfalNfcDevice *dev = nullptr;
+    if (!_pollForTag(&dev, timeoutMs) || !dev) return false;
+    // Never mix results from a different card after removal/replacement.
+    if (dev->type != RFAL_NFC_LISTEN_TYPE_NFCA || dev->nfcidLen != uid.size ||
+        memcmp(dev->nfcid, uid.uidByte, uid.size) != 0) {
+        _nfc->rfalNfcDeactivate(false);
+        return false;
+    }
+    _parseDevice(dev);
+    _mfcAuthed = false;
+    return true;
 }
 
 int ST25R3916::recoverAllKeys() {
+    if (!_nfc || !mfcReselect(5000)) return -1;
     // Get the active device first.
     rfalNfcDevice *dev = nullptr;
     if (_nfc->rfalNfcGetActiveDevice(&dev) != ST_ERR_NONE || !dev) {
@@ -2526,7 +2539,7 @@ bool ST25R3916::_mfcRecoverPrngState(uint32_t *prngStateOut) {
     // We try all 2^16 initial states, advance to produce the first nonce, and
     // check if subsequent nonces match.
 
-    for (uint16_t candidate = 0; candidate < 0x10000; candidate++) {
+    for (uint32_t candidate = 0; candidate < 0x10000u; candidate++) {
         // The MIFARE PRNG is a 16-bit LFSR. Build a 32-bit state with the
         // candidate in the position the PRNG uses (high bits after swapendian).
         uint32_t state = ((uint32_t)candidate << 16);
@@ -2617,12 +2630,12 @@ bool ST25R3916::_mfcRecoverKeyByNestedAuth(
         return false;
     }
 
-    // Nt matches prediction. Now we know the card's PRNG state.
-    // Attempt to recover the target sector key by trying the known key:
-    // If the target sector uses the same key as the bootstrap sector, nested auth
-    // will succeed and we've recovered the key.
+    // A matching nonce is not proof of a key. Verify the candidate with a
+    // complete authentication before reporting it as found. This only checks
+    // an already-known key; unknown-key Crypto1 state recovery is not implemented.
+    if (!mfcReselect() || !_mifareAuth(block, knownKey, useKeyB)) return false;
     memcpy(recoveredKey, knownKey, 6);
-    ST25R_LOG("mfc recover: nested auth completed — key matches bootstrap key (same-key scenario)");
+    ST25R_LOG("mfc recover: candidate key verified by authentication");
     return true;
 }
 
@@ -2716,8 +2729,17 @@ int ST25R3916::_mfcRecoverAllKeys(rfalNfcDevice *dev) {
 
         ST25R_LOG("mfc recover: processing sector %u/%u", s, mfcDump.sectors);
 
-        if (_mfcRecoverSectorKeys(dev, s, bootstrapKey)) recovered++;
-        else ST25R_LOG("mfc recover: sector %u skipped", s);
+        if (_mfcRecoverSectorKeys(dev, s, bootstrapKey)) {
+            if (_mfcKeyAFound[s]) {
+                memcpy(mfcDump.keyA[s], _mfcRecoveredKeyA[s], 6);
+                mfcDump.keyAFound[s] = true;
+            }
+            if (_mfcKeyBFound[s]) {
+                memcpy(mfcDump.keyB[s], _mfcRecoveredKeyB[s], 6);
+                mfcDump.keyBFound[s] = true;
+            }
+            recovered++;
+        } else ST25R_LOG("mfc recover: sector %u skipped", s);
 
         // Re-select card between sectors.
         _mfcAuthed = false;
@@ -2786,6 +2808,9 @@ void ST25R3916::_mfcRebuildStrAllPages() {
 int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
     bruceConfig.ensureMifareKeysLoaded();
     memset(&mfcDump, 0, sizeof(mfcDump));
+    memset(_mfcKeyAFound, 0, sizeof(_mfcKeyAFound));
+    memset(_mfcKeyBFound, 0, sizeof(_mfcKeyBFound));
+    mfcLoaded = false;
     _mfcAuthed = false;
 
     if (uid.sak == 0x18 || uid.sak == 0x38) {
@@ -2881,7 +2906,11 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
                     memcpy(usedKeyBytes, _mfcRecoveredKeyB[s], 6);
                     usedKeyB = true;
                 }
-                ST25R_LOG("mfc sector %u: darkside recovery succeeded", s);
+                // Recovery ends the previous RF session; authenticate again
+                // before reading rather than treating a found key as a live cipher.
+                authed = mfcReselect() && _mifareAuth(trailer, usedKeyBytes, usedKeyB);
+                if (!authed) continue;
+                ST25R_LOG("mfc sector %u: candidate key verified", s);
             } else {
                 ST25R_LOG("mfc sector %u: darkside recovery failed", s);
                 continue;
@@ -2924,8 +2953,9 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
     _mfcRebuildStrAllPages();
     ST25R_LOG("mfc read done: %d/%u blocks", blocksOk, mfcDump.totalBlocks);
 
-    pageReadStatus = mfcLoaded ? SUCCESS : FAILURE;
-    pageReadSuccess = mfcLoaded;
+    pageReadSuccess = (blocksOk == mfcDump.totalBlocks);
+    pageReadStatus = pageReadSuccess ? SUCCESS : FAILURE;
+    dataPages = blocksOk;
     return mfcLoaded ? SUCCESS : FAILURE;
 }
 
