@@ -19,6 +19,13 @@
 // ST25R3916B I2C and SPI pin macros are supplied by the board environment flags.
 #define ST25R_I2C_ADDRESS 0x50
 
+// Cardputer ADV has one onboard RGBW status LED.
+#define LED_TYPE SK6812
+#define LED_ORDER GRB
+#define LED_TYPE_IS_RGBW 1
+#define LED_COUNT 1
+#define LED_COLOR_STEP 15
+
 // Display
 #define TFT_MOSI 35
 #define TFT_SCLK 36
