@@ -2,11 +2,13 @@
 patch_core.py — PlatformIO extra script (pre-build)
 
 Patches Arduino-ESP32 core framework files that are incompatible with
-GCC 14.x toolchains (default on modern PlatformIO platforms).
+GCC 14.x toolchains.
 
 Issues fixed:
-  1. #include directives inside extern "C" blocks — GCC 14 rejects
-     templates with C linkage. Move includes outside the block.
+  1. #include <...> (C++ standard library) inside extern "C" blocks — GCC 14
+     rejects templates with C linkage. Move ONLY angle-bracket includes
+     outside the block; keep quoted ESP-IDF headers inside so their types
+     remain visible.
   2. Esp.h: getCpuFrequencyMhz() renamed to getCpuFreqMHz()
   3. Arduino.h: conflicting makeWord(uint8_t, uint8_t) overload
   4. Wire.cpp: SDA/SCL default pin macros not defined
@@ -20,7 +22,6 @@ Import("env")  # noqa: F821
 
 FRAMEWORK_DIR = env.PioPlatform().get_package_dir("framework-arduinoespressif32")
 CORE_DIR = os.path.join(FRAMEWORK_DIR, "cores", "esp32")
-LIBS_DIR = os.path.join(FRAMEWORK_DIR, "libraries")
 
 PATCH_FLAG = os.path.join(FRAMEWORK_DIR, ".core_patched")
 
@@ -35,17 +36,18 @@ def _write(path: str, content: str) -> None:
         f.write(content)
 
 
-def _move_includes_outside_extern_c(content: str) -> str:
+def _move_cpp_includes_outside_extern_c(content: str) -> str:
     """
-    Move #include directives that appear inside an extern "C" block
-    to before the block, so GCC 14 does not see C++ templates inside
-    a C linkage context.
+    Move #include <...> (C++ standard library) directives that appear inside
+    an extern "C" block to before the block. Quoted #include "..." headers
+    (ESP-IDF drivers, soc, etc.) are left inside so their C types remain
+    visible to functions declared inside extern "C".
     """
     lines = content.split("\n")
     new_lines: list[str] = []
     i = 0
     in_extern_c = False
-    includes_inside: list[str] = []
+    cpp_includes_inside: list[str] = []
 
     while i < len(lines):
         line = lines[i]
@@ -58,20 +60,20 @@ def _move_includes_outside_extern_c(content: str) -> str:
             i += 1
             continue
 
-        # Detect closing brace of extern "C" block (standalone })
+        # Detect closing brace of extern "C" block
         if in_extern_c and stripped == "}":
-            # Emit collected includes first, then the closing brace
-            for inc in includes_inside:
+            # Emit collected C++ includes first, then the closing brace
+            for inc in cpp_includes_inside:
                 new_lines.append(inc)
-            includes_inside = []
+            cpp_includes_inside = []
             in_extern_c = False
             new_lines.append(line)
             i += 1
             continue
 
-        # If inside extern C, collect #include lines to move out
-        if in_extern_c and stripped.startswith('#include "'):
-            includes_inside.append(line)
+        # If inside extern C, collect C++ #include <...> lines to move out
+        if in_extern_c and stripped.startswith('#include <'):
+            cpp_includes_inside.append(line)
             i += 1
             continue
 
@@ -81,22 +83,41 @@ def _move_includes_outside_extern_c(content: str) -> str:
     return "\n".join(new_lines)
 
 
-def _patch_hal_gpio() -> None:
-    path = os.path.join(CORE_DIR, "esp32-hal-gpio.h")
-    content = _read(path)
-    new_content = _move_includes_outside_extern_c(content)
-    if new_content != content:
-        _write(path, new_content)
-        print("patch_core: esp32-hal-gpio.h — moved includes outside extern C")
+# Core headers known to have extern "C" + C++ include conflicts
+_HAL_HEADERS = [
+    "esp32-hal-adc.h",
+    "esp32-hal-cpu.h",
+    "esp32-hal-dac.h",
+    "esp32-hal-gpio.h",
+    "esp32-hal-i2c.h",
+    "esp32-hal-i2c-slave.h",
+    "esp32-hal-ledc.h",
+    "esp32-hal-ldo.h",
+    "esp32-hal-log.h",
+    "esp32-hal-matrix.h",
+    "esp32-hal-periman.h",
+    "esp32-hal-psram.h",
+    "esp32-hal-rgb-led.h",
+    "esp32-hal-spi.h",
+    "esp32-hal-touch.h",
+    "esp32-hal-touch-ng.h",
+    "esp32-hal-timer.h",
+    "esp32-hal-tinyusb.h",
+    "esp32-hal-uart.h",
+    "esp32-hal.h",
+]
 
 
-def _patch_hal_h() -> None:
-    path = os.path.join(CORE_DIR, "esp32-hal.h")
-    content = _read(path)
-    new_content = _move_includes_outside_extern_c(content)
-    if new_content != content:
-        _write(path, new_content)
-        print("patch_core: esp32-hal.h — moved includes outside extern C")
+def _patch_all_hal_headers() -> None:
+    for fname in _HAL_HEADERS:
+        path = os.path.join(CORE_DIR, fname)
+        if not os.path.isfile(path):
+            continue
+        content = _read(path)
+        new_content = _move_cpp_includes_outside_extern_c(content)
+        if new_content != content:
+            _write(path, new_content)
+            print(f"patch_core: {fname} — moved C++ includes outside extern C")
 
 
 def _patch_esp_h() -> None:
@@ -120,6 +141,7 @@ def _patch_arduino_h() -> None:
 
 
 def _patch_wire_cpp() -> None:
+    LIBS_DIR = os.path.join(FRAMEWORK_DIR, "libraries")
     path = os.path.join(LIBS_DIR, "Wire", "src", "Wire.cpp")
     content = _read(path)
     if "#ifndef SDA" not in content:
@@ -140,54 +162,16 @@ def _patch_wire_cpp() -> None:
         print("patch_core: Wire.cpp — added SDA/SCL fallback defines")
 
 
-# Additional core headers with extern "C" + #include patterns
-_HAL_HEADERS = [
-    "esp32-hal-adc.h",
-    "esp32-hal-cpu.h",
-    "esp32-hal-dac.h",
-    "esp32-hal-gpio.h",
-    "esp32-hal-i2c.h",
-    "esp32-hal-i2c-slave.h",
-    "esp32-hal-ledc.h",
-    "esp32-hal-ldo.h",
-    "esp32-hal-log.h",
-    "esp32-hal-matrix.h",
-    "esp32-hal-periman.h",
-    "esp32-hal-psram.h",
-    "esp32-hal-rgb-led.h",
-    "esp32-hal-spi.h",
-    "esp32-hal-touch.h",
-    "esp32-hal-touch-ng.h",
-    "esp32-hal-timer.h",
-    "esp32-hal-tinyusb.h",
-    "esp32-hal-uart.h",
-]
-
-
-def _patch_all_hal_headers() -> None:
-    for fname in _HAL_HEADERS:
-        path = os.path.join(CORE_DIR, fname)
-        if not os.path.isfile(path):
-            continue
-        content = _read(path)
-        new_content = _move_includes_outside_extern_c(content)
-        if new_content != content:
-            _write(path, new_content)
-            print(f"patch_core: {fname} — moved includes outside extern C")
-
-
 def main() -> None:
     if os.path.isfile(PATCH_FLAG):
         print("patch_core: already applied, skipping")
         return
 
     print("patch_core: applying GCC 14 compatibility patches...")
-    _patch_hal_gpio()
-    _patch_hal_h()
+    _patch_all_hal_headers()
     _patch_esp_h()
     _patch_arduino_h()
     _patch_wire_cpp()
-    _patch_all_hal_headers()
 
     # Touch the flag file so we don't re-patch on subsequent builds
     with open(PATCH_FLAG, "w") as f:
