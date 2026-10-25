@@ -126,7 +126,7 @@ private:
     };
     static constexpr int MFC_NONCE_MAX_SAMPLES = 256;
 
-    uint32_t _mfcRecoverPrngState = 0; // recovered PRNG state for nonce prediction
+    uint32_t _mfcRecoveredPrngState = 0; // recovered PRNG state for nonce prediction
     MfcNonceSample _mfcNonces[MFC_NONCE_MAX_SAMPLES];
     int _mfcNonceCount = 0;
     uint8_t _mfcRecoveredKeyA[40][6]; // recovered Key A per sector

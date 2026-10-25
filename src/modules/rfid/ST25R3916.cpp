@@ -2545,7 +2545,7 @@ bool ST25R3916::_mfcRecoverPrngState(uint32_t *prngStateOut) {
                 if (s != _mfcNonces[j].nt) { matched = false; break; }
             }
             if (matched) {
-                _mfcRecoverPrngState = s;
+                _mfcRecoveredPrngState = s;
                 if (prngStateOut) *prngStateOut = s;
                 ST25R_LOG("mfc recover: PRNG state recovered: candidate=%04X firstSteps=%d state=%08lX",
                           candidate, firstSteps, (unsigned long)s);
@@ -2574,7 +2574,7 @@ bool ST25R3916::_mfcRecoverKeyByNestedAuth(
     }
 
     // Predict the next nonce using the recovered PRNG state.
-    uint32_t predictedNt = prng_successor(_mfcRecoverPrngState, 1);
+    uint32_t predictedNt = prng_successor(_mfcRecoveredPrngState, 1);
     ST25R_LOG("mfc recover: predicted Nt=%08lX", (unsigned long)predictedNt);
 
     // Send nested authentication command to the target block.
