@@ -23,7 +23,9 @@ Import("env")  # noqa: F821
 FRAMEWORK_DIR = env.PioPlatform().get_package_dir("framework-arduinoespressif32")
 CORE_DIR = os.path.join(FRAMEWORK_DIR, "cores", "esp32")
 
-PATCH_FLAG = os.path.join(FRAMEWORK_DIR, ".core_patched")
+# No PATCH_FLAG — patches are idempotent and safe to re-apply every build.
+# This avoids issues with PlatformIO caching the flag file and skipping
+# updated patch logic on subsequent CI runs.
 
 
 def _read(path: str) -> str:
@@ -217,19 +219,11 @@ def _patch_wire_cpp() -> None:
 
 
 def main() -> None:
-    if os.path.isfile(PATCH_FLAG):
-        print("patch_core: already applied, skipping")
-        return
-
     print("patch_core: applying GCC 14 compatibility patches...")
     _patch_all_hal_headers()
     _patch_esp_h()
     _patch_arduino_h()
     _patch_wire_cpp()
-
-    # Touch the flag file so we don't re-patch on subsequent builds
-    with open(PATCH_FLAG, "w") as f:
-        f.write("")
     print("patch_core: done")
 
 
