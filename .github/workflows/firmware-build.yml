@@ -33,23 +33,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Override PIO_ENV from workflow_dispatch input
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          echo "PIO_ENV=${{ github.event.inputs.env_name }}" >> $GITHUB_ENV
-          if [ "${{ github.event.inputs.create_release }}" = "true" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
-            echo "CREATE_RELEASE=true" >> $GITHUB_ENV
-          else
-            echo "CREATE_RELEASE=false" >> $GITHUB_ENV
-          fi
-
-      - name: Set CREATE_RELEASE for non-dispatch runs
-        if: github.event_name != 'workflow_dispatch'
-        shell: bash
-        run: |
-          echo "CREATE_RELEASE=false" >> $GITHUB_ENV
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -118,8 +101,8 @@ jobs:
           path: ${{ steps.package.outputs.zip_path }}
           retention-days: 30
 
-      - name: Create GitHub release
-        if: ${{ env.CREATE_RELEASE == 'true' }}
+      - name: Create GitHub release (main only)
+        if: ${{ github.ref == 'refs/heads/main' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: firmware-${{ env.PIO_ENV }}-${{ github.run_id }}
