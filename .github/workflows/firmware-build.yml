@@ -1,0 +1,142 @@
+name: Build M5Stack Cardputer ADV Firmware
+
+on:
+  push:
+    branches:
+      - feature/mifare-classic-recovery-cardputer-adv
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      env_name:
+        description: "PlatformIO environment to build"
+        required: true
+        default: "m5stack-cardputer-adv"
+      create_release:
+        description: "Create GitHub release"
+        required: true
+        default: "true"
+
+env:
+  PLATFORMIO_CORE_DIR: ${{ runner.temp }}/.platformio
+  PIO_BUILD_DIR: .pio
+  PIO_ENV: ${{ inputs.env_name || 'm5stack-cardputer-adv' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            python3-pip python3-venv python3-setuptools \
+            git curl wget build-essential cmake ninja-build \
+            libssl-dev libffi-dev libusb-1.0-0-dev \
+            unzip zip
+
+      - name: Install PlatformIO
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install platformio
+          pio --version
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.PLATFORMIO_CORE_DIR }}/packages
+            ${{ env.PLATFORMIO_CORE_DIR }}/cache
+          key: ${{ runner.os }}-pio-packages-${{ hashFiles('platformio.ini') }}-${{ hashFiles('**/lib_deps*') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-packages-
+
+      - name: Cache PlatformIO build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.PIO_BUILD_DIR }}/buildcache
+            ${{ env.PIO_BUILD_DIR }}/cache
+          key: ${{ runner.os }}-pio-build-${{ github.job }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-pio-build-
+
+      - name: Build firmware (${{ env.PIO_ENV }})
+        run: |
+          pio run -e ${{ env.PIO_ENV }}
+
+      - name: Package firmware as zip
+        id: package
+        run: |
+          BUILD_DIR="${{ env.PIO_BUILD_DIR }}/${{ env.PIO_ENV }}"
+          FIRMWARE_BIN="$BUILD_DIR/firmware.bin"
+          if [ ! -f "$FIRMWARE_BIN" ]; then
+            echo "Firmware binary not found at $FIRMWARE_BIN"
+            exit 1
+          fi
+          # Create zip with firmware.bin and metadata
+          ZIP_NAME="firmware-${{ env.PIO_ENV }}-${{ github.run_id }}.zip"
+          cd "$BUILD_DIR"
+          zip -r "/tmp/$ZIP_NAME" firmware.bin firmware.elf 2>/dev/null || zip "/tmp/$ZIP_NAME" firmware.bin
+          echo "zip_path=/tmp/$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo "zip_name=$ZIP_NAME" >> $GITHUB_OUTPUT
+          echo "firmware_size=$(stat -c%s "$FIRMWARE_BIN")" >> $GITHUB_OUTPUT
+
+      - name: Upload firmware zip as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ env.PIO_ENV }}-zip
+          path: ${{ steps.package.outputs.zip_path }}
+          retention-days: 30
+
+      - name: Create GitHub release
+        if: ${{ inputs.create_release == 'true' && github.ref == 'refs/heads/main' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: firmware-${{ env.PIO_ENV }}-${{ github.run_id }}
+          name: "M5Stack Cardputer ADV Firmware ${{ env.PIO_ENV }} (${{ github.run_id }})"
+          body: |
+            ## M5Stack Cardputer ADV Firmware
+
+            **Environment:** ${{ env.PIO_ENV }}
+            **Build:** ${{ github.run_id }}
+            **Commit:** ${{ github.sha }}
+            **Size:** ${{ steps.package.outputs.firmware_size }} bytes
+
+            ### Features
+            - ST25R3916B NFC support (I2C Port A)
+            - MIFARE Classic 1K/4K/Mini read + diagnostics
+            - Darkside/nested key recovery (authorized keys only)
+            - MIFARE Classic diagnostic mode with per-block error classification
+            - Partial-read protection (never misrepresented as complete dump)
+
+            ### Installation
+            Flash with `esptool.py` or PlatformIO:
+            ```bash
+            esptool.py --port /dev/ttyUSB0 write_flash 0x0 firmware.bin
+            ```
+          files: ${{ steps.package.outputs.zip_path }}
+          draft: false
+          prerelease: false
+
+      - name: Print firmware info
+        run: |
+          echo "Firmware built successfully!"
+          echo "Environment: ${{ env.PIO_ENV }}"
+          echo "Zip: ${{ steps.package.outputs.zip_path }}"
+          echo "Size: ${{ steps.package.outputs.firmware_size }} bytes"

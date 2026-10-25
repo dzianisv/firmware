@@ -26,7 +26,8 @@ public:
         EMULATE_NDEF_MODE,
         ERASE_MODE,
         LOAD_MODE,
-        SAVE_MODE
+        SAVE_MODE,
+        DIAG_MODE      // MIFARE Classic diagnostic + key recovery mode
     };
 
     /////////////////////////////////////////////////////////////////////////////////////
@@ -68,6 +69,15 @@ private:
     String _sourceUID;
     String _sourcePages;
 
+    // Diagnostic mode state
+    uint8_t _diagSector = 0;
+    uint8_t _diagBlock = 0;
+    uint16_t _diagBlocksOk = 0;
+    uint16_t _diagBlocksFail = 0;
+    uint8_t _diagErrorClass = 0; // 0=auth,1=timeout,2=RF,3=unsupported,4=internal
+    bool _diagRunning = false;
+    bool _diagCancel = false;
+
     /////////////////////////////////////////////////////////////////////////////////////
     // Display functions
     /////////////////////////////////////////////////////////////////////////////////////
@@ -102,6 +112,14 @@ private:
     void save_file();
     void save_scan_result();
     void load_file();
+
+    /////////////////////////////////////////////////////////////////////////////////////
+    // MIFARE Classic diagnostics + key recovery (DIAG_MODE)
+    /////////////////////////////////////////////////////////////////////////////////////
+    void diag_card();                              // main diagnostic loop
+    void diag_displaySector(uint8_t sector, uint8_t block, bool authOk, bool readOk, const char *error);
+    void diag_recoverKeys();                       // run darkside key recovery on all sectors
+    void diag_printKeyTable();                     // display recovered keys
 
     /////////////////////////////////////////////////////////////////////////////////////
     // NDEF
