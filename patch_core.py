@@ -144,6 +144,9 @@ def _patch_wire_cpp() -> None:
     LIBS_DIR = os.path.join(FRAMEWORK_DIR, "libraries")
     path = os.path.join(LIBS_DIR, "Wire", "src", "Wire.cpp")
     content = _read(path)
+    modified = False
+
+    # Add SDA/SCL fallback defines
     if "#ifndef SDA" not in content:
         lines = content.split("\n")
         insert_at = 0
@@ -158,8 +161,24 @@ def _patch_wire_cpp() -> None:
         lines.insert(insert_at + 3, "#ifndef SCL")
         lines.insert(insert_at + 4, "#define SCL 22")
         lines.insert(insert_at + 5, "#endif")
-        _write(path, "\n".join(lines))
-        print("patch_core: Wire.cpp — added SDA/SCL fallback defines")
+        content = "\n".join(lines)
+        modified = True
+
+    # Ensure driver/i2c.h is included for I2C driver function declarations
+    if '#include <driver/i2c.h>' not in content and '#include "driver/i2c.h"' not in content:
+        # Insert after the last #include line
+        lines = content.split("\n")
+        last_include = 0
+        for idx, line in enumerate(lines):
+            if line.strip().startswith("#include"):
+                last_include = idx + 1
+        lines.insert(last_include, '#include <driver/i2c.h>')
+        content = "\n".join(lines)
+        modified = True
+
+    if modified:
+        _write(path, content)
+        print("patch_core: Wire.cpp — added SDA/SCL defines + driver/i2c.h include")
 
 
 def main() -> None:
