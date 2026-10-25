@@ -22,6 +22,7 @@ on:
 env:
   PLATFORMIO_CORE_DIR: ${{ runner.temp }}/.platformio
   PIO_BUILD_DIR: .pio
+  PIO_ENV: m5stack-cardputer-adv
 
 jobs:
   build:
@@ -32,21 +33,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set build environment variables
+      - name: Override PIO_ENV from workflow_dispatch input
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
-          # Determine PlatformIO environment from workflow_dispatch input or default
-          PIO_ENV="${INPUT_ENV_NAME:-m5stack-cardputer-adv}"
-          echo "PIO_ENV=$PIO_ENV" >> $GITHUB_ENV
-          # Create release only on main branch when requested
-          if [ "${INPUT_CREATE_RELEASE:-false}" = "true" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+          echo "PIO_ENV=${{ github.event.inputs.env_name }}" >> $GITHUB_ENV
+          if [ "${{ github.event.inputs.create_release }}" = "true" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
             echo "CREATE_RELEASE=true" >> $GITHUB_ENV
           else
             echo "CREATE_RELEASE=false" >> $GITHUB_ENV
           fi
-        env:
-          INPUT_ENV_NAME: ${{ github.event.inputs.env_name }}
-          INPUT_CREATE_RELEASE: ${{ github.event.inputs.create_release }}
+
+      - name: Set CREATE_RELEASE for non-dispatch runs
+        if: github.event_name != 'workflow_dispatch'
+        shell: bash
+        run: |
+          echo "CREATE_RELEASE=false" >> $GITHUB_ENV
 
       - name: Set up Python
         uses: actions/setup-python@v5
