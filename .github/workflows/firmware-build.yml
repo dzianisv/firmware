@@ -22,12 +22,13 @@ on:
 env:
   PLATFORMIO_CORE_DIR: ${{ runner.temp }}/.platformio
   PIO_BUILD_DIR: .pio
-  PIO_ENV: ${{ inputs.env_name || 'm5stack-cardputer-adv' }}
+  PIO_ENV: ${{ github.event.inputs.env_name || 'm5stack-cardputer-adv' }}
+  CREATE_RELEASE: ${{ github.event.inputs.create_release || 'false' }}
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -62,7 +63,7 @@ jobs:
           path: |
             ${{ env.PLATFORMIO_CORE_DIR }}/packages
             ${{ env.PLATFORMIO_CORE_DIR }}/cache
-          key: ${{ runner.os }}-pio-packages-${{ hashFiles('platformio.ini') }}-${{ hashFiles('**/lib_deps*') }}
+          key: ${{ runner.os }}-pio-packages-${{ hashFiles('platformio.ini') }}
           restore-keys: |
             ${{ runner.os }}-pio-packages-
 
@@ -72,7 +73,7 @@ jobs:
           path: |
             ${{ env.PIO_BUILD_DIR }}/buildcache
             ${{ env.PIO_BUILD_DIR }}/cache
-          key: ${{ runner.os }}-pio-build-${{ github.job }}-${{ github.run_id }}
+          key: ${{ runner.os }}-pio-build-${{ github.run_attempt }}
           restore-keys: |
             ${{ runner.os }}-pio-build-
 
@@ -89,7 +90,6 @@ jobs:
             echo "Firmware binary not found at $FIRMWARE_BIN"
             exit 1
           fi
-          # Create zip with firmware.bin and metadata
           ZIP_NAME="firmware-${{ env.PIO_ENV }}-${{ github.run_id }}.zip"
           cd "$BUILD_DIR"
           zip -r "/tmp/$ZIP_NAME" firmware.bin firmware.elf 2>/dev/null || zip "/tmp/$ZIP_NAME" firmware.bin
@@ -105,7 +105,7 @@ jobs:
           retention-days: 30
 
       - name: Create GitHub release
-        if: ${{ inputs.create_release == 'true' && github.ref == 'refs/heads/main' }}
+        if: ${{ env.CREATE_RELEASE == 'true' && github.ref == 'refs/heads/main' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: firmware-${{ env.PIO_ENV }}-${{ github.run_id }}
@@ -133,6 +133,8 @@ jobs:
           files: ${{ steps.package.outputs.zip_path }}
           draft: false
           prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Print firmware info
         run: |
