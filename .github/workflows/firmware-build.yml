@@ -5,6 +5,7 @@ on:
     branches:
       - feature/mifare-classic-recovery-cardputer-adv
       - main
+  workflow_dispatch:
 
 env:
   PIO_ENV: m5stack-cardputer-adv
