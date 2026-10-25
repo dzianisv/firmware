@@ -175,7 +175,7 @@ def _patch_arduino_h() -> None:
         modified = True
 
     # Add <cstdlib> include before random() declarations to avoid conflicts
-    // with C library random() declarations when included inside extern "C"
+    # with C library random() declarations when included inside extern "C"
     if "long random(long);" in content and "#include <cstdlib>" not in content:
         # Insert <cstdlib> near the top, after the include guard
         lines = content.split("\n")
