@@ -22,8 +22,6 @@ on:
 env:
   PLATFORMIO_CORE_DIR: ${{ runner.temp }}/.platformio
   PIO_BUILD_DIR: .pio
-  PIO_ENV: ${{ github.event.inputs.env_name || 'm5stack-cardputer-adv' }}
-  CREATE_RELEASE: ${{ github.event.inputs.create_release || 'false' }}
 
 jobs:
   build:
@@ -35,6 +33,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Set build environment variables
+        run: |
+          # Determine the PlatformIO environment to build
+          PIO_ENV="${{ github.event.inputs.env_name || 'm5stack-cardputer-adv' }}"
+          echo "PIO_ENV=$PIO_ENV" >> $GITHUB_ENV
+          # Determine whether to create a GitHub release (only on main)
+          if [ "${{ github.event.inputs.create_release || 'false' }}" = "true" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "CREATE_RELEASE=true" >> $GITHUB_ENV
+          else
+            echo "CREATE_RELEASE=false" >> $GITHUB_ENV
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -105,7 +115,7 @@ jobs:
           retention-days: 30
 
       - name: Create GitHub release
-        if: ${{ env.CREATE_RELEASE == 'true' && github.ref == 'refs/heads/main' }}
+        if: ${{ env.CREATE_RELEASE == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: firmware-${{ env.PIO_ENV }}-${{ github.run_id }}
