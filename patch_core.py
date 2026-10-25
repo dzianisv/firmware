@@ -20,6 +20,7 @@ Import("env")  # noqa: F821
 
 FRAMEWORK_DIR = env.PioPlatform().get_package_dir("framework-arduinoespressif32")
 CORE_DIR = os.path.join(FRAMEWORK_DIR, "cores", "esp32")
+LIBS_DIR = os.path.join(FRAMEWORK_DIR, "libraries")
 
 PATCH_FLAG = os.path.join(FRAMEWORK_DIR, ".core_patched")
 
@@ -119,8 +120,7 @@ def _patch_arduino_h() -> None:
 
 
 def _patch_wire_cpp() -> None:
-    path = os.path.join(CORE_DIR, "..", "libraries", "Wire", "src", "Wire.cpp")
-    path = os.path.normpath(path)
+    path = os.path.join(LIBS_DIR, "Wire", "src", "Wire.cpp")
     content = _read(path)
     if "#ifndef SDA" not in content:
         lines = content.split("\n")
