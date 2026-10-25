@@ -11,11 +11,11 @@ Issues fixed:
      remain visible.
   2. Esp.h: getCpuFrequencyMhz() renamed to getCpuFreqMHz()
   3. Arduino.h: conflicting makeWord(uint8_t, uint8_t) overload
-  4. Wire.cpp: SDA/SCL default pin macros not defined
+  4. Wire.cpp: SDA/SCL default pin macros not defined; missing I2C driver
+     function declarations (removed in ESP-IDF v5.x)
 """
 
 import os
-import re
 from typing import Any
 
 Import("env")  # noqa: F821
@@ -53,16 +53,13 @@ def _move_cpp_includes_outside_extern_c(content: str) -> str:
         line = lines[i]
         stripped = line.strip()
 
-        # Detect start of extern "C" block
         if 'extern "C" {' in line and not in_extern_c:
             in_extern_c = True
             new_lines.append(line)
             i += 1
             continue
 
-        # Detect closing brace of extern "C" block
         if in_extern_c and stripped == "}":
-            # Emit collected C++ includes first, then the closing brace
             for inc in cpp_includes_inside:
                 new_lines.append(inc)
             cpp_includes_inside = []
@@ -71,7 +68,6 @@ def _move_cpp_includes_outside_extern_c(content: str) -> str:
             i += 1
             continue
 
-        # If inside extern C, collect C++ #include <...> lines to move out
         if in_extern_c and stripped.startswith('#include <'):
             cpp_includes_inside.append(line)
             i += 1
@@ -127,7 +123,7 @@ def _patch_esp_h() -> None:
         content = content.replace("return getCpuFrequencyMhz();",
                                   "return getCpuFreqMHz();")
         _write(path, content)
-        print("patch_core: Esp.h — getCpuFrequencyMhz → getCpuFreqMHz")
+        print("patch_core: Esp.h — getCpuFrequencyMhz -> getCpuFreqMHz")
 
 
 def _patch_arduino_h() -> None:
@@ -166,7 +162,6 @@ def _patch_wire_cpp() -> None:
 
     # Ensure driver/i2c.h is included for I2C driver function declarations
     if '#include <driver/i2c.h>' not in content and '#include "driver/i2c.h"' not in content:
-        # Insert after the last #include line
         lines = content.split("\n")
         last_include = 0
         for idx, line in enumerate(lines):
@@ -177,26 +172,11 @@ def _patch_wire_cpp() -> None:
         modified = True
 
     # Add forward declarations for ESP-IDF I2C driver functions that were
-    // removed in ESP-IDF v5.x but still referenced by Arduino-ESP32 3.3.9's Wire.cpp
-    i2c_decls = '''
-// ESP-IDF v5.x removed these legacy I2C driver functions. Declare them here
-// so Wire.cpp compiles. If the ESP-IDF library still provides them (as
-// deprecated wrappers), the linker will resolve them.
-extern "C" {
-    int i2cDeinit(int num);
-    int i2cGetClock(int num, uint32_t *frequency);
-    int i2cSetClock(int num, uint32_t frequency);
-    int i2cWrite(int num, uint8_t addr, uint8_t *data, uint32_t length, uint32_t timeout);
-    int i2cWriteReadNonStop(int num, uint8_t addr, uint8_t *data_wr, uint32_t wr_len,
-                           uint8_t *data_rd, uint32_t rd_len, uint32_t timeout,
-                           uint32_t *rd_length);
-    int i2cRead(int num, uint8_t addr, uint8_t *data, uint32_t length,
-               uint32_t timeout, uint32_t *read_length);
-}
-'''
-
+    # removed in ESP-IDF v5.x but still referenced by Arduino-ESP32 3.3.9's
+    # Wire.cpp. Declaring them here lets the compiler accept the calls;
+    # if the ESP-IDF library still provides them (as deprecated wrappers),
+    # the linker will resolve them.
     if "i2cDeinit" not in content:
-        # Insert after the includes block
         lines = content.split("\n")
         insert_at = 0
         for idx, line in enumerate(lines):
@@ -204,7 +184,30 @@ extern "C" {
                 insert_at = idx + 1
             elif insert_at > 0:
                 break
-        lines.insert(insert_at, i2c_decls.strip())
+        i2c_decls = [
+            '',
+            '// ESP-IDF v5.x removed these legacy I2C driver functions.',
+            '// Declared here so Wire.cpp compiles; linker resolves if',
+            '// the ESP-IDF library still provides them.',
+            'extern "C" {',
+            '    int i2cDeinit(int num);',
+            '    int i2cGetClock(int num, uint32_t *frequency);',
+            '    int i2cSetClock(int num, uint32_t frequency);',
+            '    int i2cWrite(int num, uint8_t addr, uint8_t *data,',
+            '                 uint32_t length, uint32_t timeout);',
+            '    int i2cWriteReadNonStop(int num, uint8_t addr,',
+            '                      uint8_t *data_wr, uint32_t wr_len,',
+            '                      uint8_t *data_rd, uint32_t rd_len,',
+            '                      uint32_t timeout,',
+            '                      uint32_t *rd_length);',
+            '    int i2cRead(int num, uint8_t addr, uint8_t *data,',
+            '                uint32_t length, uint32_t timeout,',
+            '                uint32_t *read_length);',
+            '}',
+            '',
+        ]
+        for j, decl in enumerate(i2c_decls):
+            lines.insert(insert_at + j, decl)
         content = "\n".join(lines)
         modified = True
 
