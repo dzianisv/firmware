@@ -11,12 +11,40 @@ on:
   workflow_dispatch:
 
 env:
+  PLATFORMIO_CORE_DIR: ${{ runner.temp }}/.platformio
+  PIO_BUILD_DIR: .pio
   PIO_ENV: m5stack-cardputer-adv
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
     steps:
-      - uses: actions/checkout@v4
-      - run: echo "PIO_ENV=${{ env.PIO_ENV }}"
-      - run: echo "Build would run here"
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            python3-pip python3-venv python3-setuptools \
+            git curl wget build-essential cmake ninja-build \
+            libssl-dev libffi-dev libusb-1.0-0-dev \
+            unzip zip
+
+      - name: Install PlatformIO
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install platformio
+          pio --version
+
+      - name: Build firmware
+        run: |
+          pio run -e ${{ env.PIO_ENV }}
