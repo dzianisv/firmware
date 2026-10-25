@@ -9,15 +9,6 @@ on:
     branches:
       - main
   workflow_dispatch:
-    inputs:
-      env_name:
-        description: "PlatformIO environment to build"
-        required: true
-        default: "m5stack-cardputer-adv"
-      create_release:
-        description: "Create GitHub release"
-        required: true
-        default: "true"
 
 env:
   PLATFORMIO_CORE_DIR: ${{ runner.temp }}/.platformio
