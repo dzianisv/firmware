@@ -6,26 +6,25 @@ GCC 14.x toolchains.
 
 Issues fixed:
   1. #include <...> (C++ standard library) inside extern "C" blocks — GCC 14
-     rejects templates with C linkage. Move ONLY angle-bracket includes
-     outside the block; keep quoted ESP-IDF headers inside so their types
-     remain visible.
+     rejects templates with C linkage. Move angle-bracket includes outside
+     the block; keep quoted ESP-IDF headers inside so their C types remain
+     visible to functions declared inside extern "C".
   2. Esp.h: getCpuFrequencyMhz() renamed to getCpuFreqMHz()
   3. Arduino.h: conflicting makeWord(uint8_t, uint8_t) overload
-  4. Wire.cpp: SDA/SCL default pin macros not defined; missing I2C driver
-     function declarations (removed in ESP-IDF v5.x)
+  4. Wire.cpp: SDA/SCL default pin macros; missing I2C driver function
+     declarations (removed in ESP-IDF v5.x); missing <cstdint> for uint32_t
+     / uint8_t types used in our forward declarations.
 """
 
 import os
-from typing import Any
 
 Import("env")  # noqa: F821
 
 FRAMEWORK_DIR = env.PioPlatform().get_package_dir("framework-arduinoespressif32")
 CORE_DIR = os.path.join(FRAMEWORK_DIR, "cores", "esp32")
+LIBS_DIR = os.path.join(FRAMEWORK_DIR, "libraries")
 
 # No PATCH_FLAG — patches are idempotent and safe to re-apply every build.
-# This avoids issues with PlatformIO caching the flag file and skipping
-# updated patch logic on subsequent CI runs.
 
 
 def _read(path: str) -> str:
@@ -50,6 +49,7 @@ def _move_cpp_includes_outside_extern_c(content: str) -> str:
     i = 0
     in_extern_c = False
     cpp_includes_inside: list[str] = []
+    brace_depth = 0
 
     while i < len(lines):
         line = lines[i]
@@ -57,21 +57,29 @@ def _move_cpp_includes_outside_extern_c(content: str) -> str:
 
         if 'extern "C" {' in line and not in_extern_c:
             in_extern_c = True
+            brace_depth = line.count("{") - line.count("}")
             new_lines.append(line)
             i += 1
             continue
 
-        if in_extern_c and stripped == "}":
-            for inc in cpp_includes_inside:
-                new_lines.append(inc)
-            cpp_includes_inside = []
-            in_extern_c = False
-            new_lines.append(line)
-            i += 1
-            continue
+        if in_extern_c:
+            brace_depth += line.count("{") - line.count("}")
+            if brace_depth <= 0 and stripped == "}":
+                # Emit all collected C++ includes before the closing brace
+                for inc in cpp_includes_inside:
+                    new_lines.append(inc)
+                cpp_includes_inside = []
+                in_extern_c = False
+                new_lines.append(line)
+                i += 1
+                continue
 
-        if in_extern_c and stripped.startswith('#include <'):
-            cpp_includes_inside.append(line)
+            if stripped.startswith('#include <'):
+                cpp_includes_inside.append(line)
+                i += 1
+                continue
+
+            new_lines.append(line)
             i += 1
             continue
 
@@ -81,70 +89,88 @@ def _move_cpp_includes_outside_extern_c(content: str) -> str:
     return "\n".join(new_lines)
 
 
-# Core headers known to have extern "C" + C++ include conflicts
-_HAL_HEADERS = [
-    "esp32-hal-adc.h",
-    "esp32-hal-cpu.h",
-    "esp32-hal-dac.h",
-    "esp32-hal-gpio.h",
-    "esp32-hal-i2c.h",
-    "esp32-hal-i2c-slave.h",
-    "esp32-hal-ledc.h",
-    "esp32-hal-ldo.h",
-    "esp32-hal-log.h",
-    "esp32-hal-matrix.h",
-    "esp32-hal-periman.h",
-    "esp32-hal-psram.h",
-    "esp32-hal-rgb-led.h",
-    "esp32-hal-spi.h",
-    "esp32-hal-touch.h",
-    "esp32-hal-touch-ng.h",
-    "esp32-hal-timer.h",
-    "esp32-hal-tinyusb.h",
-    "esp32-hal-uart.h",
-    "esp32-hal.h",
-]
-
-
 def _patch_all_hal_headers() -> None:
-    for fname in _HAL_HEADERS:
+    """Scan ALL .h files in cores/esp32 for extern "C" + C++ include conflicts,
+    not just a hardcoded list. This ensures we never miss a header."""
+    if not os.path.isdir(CORE_DIR):
+        print(f"patch_core: CORE_DIR not found: {CORE_DIR}")
+        return
+
+    count = 0
+    for fname in sorted(os.listdir(CORE_DIR)):
+        if not fname.endswith(".h"):
+            continue
         path = os.path.join(CORE_DIR, fname)
-        if not os.path.isfile(path):
+        # Skip ESP-IDF wrapper headers that are generated/included differently
+        if fname in ("sdkconfig.h",):
             continue
         content = _read(path)
+        if 'extern "C" {' not in content:
+            continue
+        # Only patch if there's a #include <...> inside extern "C"
+        in_block = False
+        has_cpp_include_inside = False
+        for line in content.split("\n"):
+            stripped = line.strip()
+            if 'extern "C" {' in stripped:
+                in_block = True
+                continue
+            if in_block and stripped == "}":
+                in_block = False
+                continue
+            if in_block and stripped.startswith("#include <"):
+                has_cpp_include_inside = True
+                break
+
+        if not has_cpp_include_inside:
+            continue
+
         new_content = _move_cpp_includes_outside_extern_c(content)
         if new_content != content:
             _write(path, new_content)
+            count += 1
             print(f"patch_core: {fname} — moved C++ includes outside extern C")
+
+    print(f"patch_core: patched {count} HAL header(s)")
 
 
 def _patch_esp_h() -> None:
     path = os.path.join(CORE_DIR, "Esp.h")
+    if not os.path.isfile(path):
+        return
     content = _read(path)
     if "getCpuFrequencyMhz()" in content:
-        content = content.replace("return getCpuFrequencyMhz();",
-                                  "return getCpuFreqMHz();")
+        content = content.replace("getCpuFrequencyMhz()", "getCpuFreqMHz()")
         _write(path, content)
         print("patch_core: Esp.h — getCpuFrequencyMhz -> getCpuFreqMHz")
 
 
 def _patch_arduino_h() -> None:
     path = os.path.join(CORE_DIR, "Arduino.h")
+    if not os.path.isfile(path):
+        return
     content = _read(path)
+    modified = False
+
+    # Remove conflicting makeWord(uint8_t, uint8_t) overload
     if "uint16_t makeWord(uint8_t h, uint8_t l);" in content:
-        content = content.replace(
-            "uint16_t makeWord(uint8_t h, uint8_t l);\n", "")
+        content = content.replace("uint16_t makeWord(uint8_t h, uint8_t l);\n", "")
+        modified = True
+
+    if modified:
         _write(path, content)
         print("patch_core: Arduino.h — removed conflicting makeWord overload")
 
 
 def _patch_wire_cpp() -> None:
-    LIBS_DIR = os.path.join(FRAMEWORK_DIR, "libraries")
     path = os.path.join(LIBS_DIR, "Wire", "src", "Wire.cpp")
+    if not os.path.isfile(path):
+        print(f"patch_core: Wire.cpp not found at {path}")
+        return
     content = _read(path)
     modified = False
 
-    # Add SDA/SCL fallback defines
+    # Add SDA/SCL fallback defines right after the includes block
     if "#ifndef SDA" not in content:
         lines = content.split("\n")
         insert_at = 0
@@ -162,7 +188,7 @@ def _patch_wire_cpp() -> None:
         content = "\n".join(lines)
         modified = True
 
-    # Ensure driver/i2c.h is included for I2C driver function declarations
+    # Ensure driver/i2c.h is included
     if '#include <driver/i2c.h>' not in content and '#include "driver/i2c.h"' not in content:
         lines = content.split("\n")
         last_include = 0
@@ -173,13 +199,10 @@ def _patch_wire_cpp() -> None:
         content = "\n".join(lines)
         modified = True
 
-    # Add forward declarations for ESP-IDF I2C driver functions that were
-    # removed in ESP-IDF v5.x but still referenced by Arduino-ESP32 3.3.9's
-    # Wire.cpp. Declaring them here lets the compiler accept the calls;
-    # if the ESP-IDF library still provides them (as deprecated wrappers),
-    # the linker will resolve them.
-    # Check for the declaration pattern, not just the string "i2cDeinit"
-    # (which appears in function calls throughout Wire.cpp).
+    # Add forward declarations for ESP-IDF I2C driver functions removed in
+    # ESP-IDF v5.x but still referenced by Arduino-ESP32 3.3.9's Wire.cpp.
+    # Check for the declaration pattern, not just "i2cDeinit" (which appears
+    # in function calls throughout Wire.cpp).
     if "int i2cDeinit(" not in content:
         lines = content.split("\n")
         insert_at = 0
@@ -188,6 +211,11 @@ def _patch_wire_cpp() -> None:
                 insert_at = idx + 1
             elif insert_at > 0:
                 break
+        # Add <cstdint> so uint32_t / uint8_t are available for our decls
+        if "#include <cstdint>" not in content:
+            lines.insert(insert_at, "#include <cstdint>")
+            insert_at += 1
+
         i2c_decls = [
             '',
             '// ESP-IDF v5.x removed these legacy I2C driver functions.',
@@ -205,10 +233,10 @@ def _patch_wire_cpp() -> None:
     '                      void *data_rd, uint32_t rd_len,',
     '                      uint32_t timeout,',
     '                      void *rd_length);',
-    '    int i2cRead(int num, uint8_t addr, void *data,',
+            '    int i2cRead(int num, uint8_t addr, void *data,',
     '                uint32_t length, uint32_t timeout,',
     '                void *read_length);',
-    '}',
+            '}',
             '',
         ]
         for j, decl in enumerate(i2c_decls):
@@ -218,7 +246,7 @@ def _patch_wire_cpp() -> None:
 
     if modified:
         _write(path, content)
-        print("patch_core: Wire.cpp — added SDA/SCL defines + driver/i2c.h + i2c decls")
+        print("patch_core: Wire.cpp — added cstdint, SDA/SCL defines + driver/i2c.h + i2c decls")
 
 
 def main() -> None:

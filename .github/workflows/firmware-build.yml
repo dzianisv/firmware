@@ -49,18 +49,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pio-packages-
 
-      - name: Cache PlatformIO build cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            .pio/buildcache
-            .pio/cache
-          key: ${{ runner.os }}-pio-build-${{ github.run_attempt }}
-          restore-keys: |
-            ${{ runner.os }}-pio-build-
-
       - name: Build firmware (m5stack-cardputer-adv)
         run: |
+          # Clean build to avoid stale objects from patched core files
+          pio run -e m5stack-cardputer-adv --clean || true
           pio run -e m5stack-cardputer-adv
 
       - name: Package firmware as zip
