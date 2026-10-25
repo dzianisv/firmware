@@ -13,6 +13,9 @@
 #include <iostream>
 #include <vector>
 #include "Arduino.h"
+#if defined(ARDUINO_M5STACK_CARDPUTER_ADV)
+#include "Keyboard_def.h"
+#endif
 
 struct Chart_t
 {
