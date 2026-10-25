@@ -176,9 +176,41 @@ def _patch_wire_cpp() -> None:
         content = "\n".join(lines)
         modified = True
 
+    # Add forward declarations for ESP-IDF I2C driver functions that were
+    // removed in ESP-IDF v5.x but still referenced by Arduino-ESP32 3.3.9's Wire.cpp
+    i2c_decls = '''
+// ESP-IDF v5.x removed these legacy I2C driver functions. Declare them here
+// so Wire.cpp compiles. If the ESP-IDF library still provides them (as
+// deprecated wrappers), the linker will resolve them.
+extern "C" {
+    int i2cDeinit(int num);
+    int i2cGetClock(int num, uint32_t *frequency);
+    int i2cSetClock(int num, uint32_t frequency);
+    int i2cWrite(int num, uint8_t addr, uint8_t *data, uint32_t length, uint32_t timeout);
+    int i2cWriteReadNonStop(int num, uint8_t addr, uint8_t *data_wr, uint32_t wr_len,
+                           uint8_t *data_rd, uint32_t rd_len, uint32_t timeout,
+                           uint32_t *rd_length);
+    int i2cRead(int num, uint8_t addr, uint8_t *data, uint32_t length,
+               uint32_t timeout, uint32_t *read_length);
+}
+'''
+
+    if "i2cDeinit" not in content:
+        # Insert after the includes block
+        lines = content.split("\n")
+        insert_at = 0
+        for idx, line in enumerate(lines):
+            if line.strip().startswith("#include"):
+                insert_at = idx + 1
+            elif insert_at > 0:
+                break
+        lines.insert(insert_at, i2c_decls.strip())
+        content = "\n".join(lines)
+        modified = True
+
     if modified:
         _write(path, content)
-        print("patch_core: Wire.cpp — added SDA/SCL defines + driver/i2c.h include")
+        print("patch_core: Wire.cpp — added SDA/SCL defines + driver/i2c.h + i2c decls")
 
 
 def main() -> None:
