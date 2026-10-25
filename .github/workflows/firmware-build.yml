@@ -31,20 +31,22 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.ref || github.ref }}
 
       - name: Set build environment variables
+        shell: bash
         run: |
-          # Determine the PlatformIO environment to build
-          PIO_ENV="${{ github.event.inputs.env_name || 'm5stack-cardputer-adv' }}"
+          # Determine PlatformIO environment from workflow_dispatch input or default
+          PIO_ENV="${INPUT_ENV_NAME:-m5stack-cardputer-adv}"
           echo "PIO_ENV=$PIO_ENV" >> $GITHUB_ENV
-          # Determine whether to create a GitHub release (only on main)
-          if [ "${{ github.event.inputs.create_release || 'false' }}" = "true" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          # Create release only on main branch when requested
+          if [ "${INPUT_CREATE_RELEASE:-false}" = "true" ] && [ "${GITHUB_REF}" = "refs/heads/main" ]; then
             echo "CREATE_RELEASE=true" >> $GITHUB_ENV
           else
             echo "CREATE_RELEASE=false" >> $GITHUB_ENV
           fi
+        env:
+          INPUT_ENV_NAME: ${{ github.event.inputs.env_name }}
+          INPUT_CREATE_RELEASE: ${{ github.event.inputs.create_release }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
