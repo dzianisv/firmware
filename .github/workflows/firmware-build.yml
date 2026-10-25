@@ -10,15 +10,9 @@ on:
       - main
   workflow_dispatch:
 
-env:
-  PLATFORMIO_CORE_DIR: ${{ runner.temp }}/.platformio
-  PIO_BUILD_DIR: .pio
-  PIO_ENV: m5stack-cardputer-adv
-
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -47,4 +41,4 @@ jobs:
 
       - name: Build firmware
         run: |
-          pio run -e ${{ env.PIO_ENV }}
+          pio run -e m5stack-cardputer-adv
