@@ -1,0 +1,17 @@
+# MIFARE Classic recovery
+- phase: build-19-flashed-55key-regression-unknown-keys-unrecovered
+- issue: none; dzianisv/firmware has disabled issues
+- success-metric: The flashed Cardputer recovers an owned laboratory card's key absent from its dictionaries, then completes fresh authentication with that key. Build, default-key read, and solver fixtures alone do not satisfy this.
+- branch: recovery-rf `work/mfc-nested-rf`; bruce-firmware `feature/mifare-classic-recovery-cardputer-adv`; base commit 078660f0
+- user authorization: own end-to-end; build and flash connected Cardputer. No NFC tag writes.
+- local changes preserved: scripts/cardputer_device.py, tests/test_cardputer_device.py, docs/CARDPUTER_ADV_BUILD_FLASH.md, .tasks/
+- review: Existing nonce prediction code did not derive keys; nested authentication decrypted with the old cipher, not the target-key cipher. Flash automation could report success after an exception; same-length backup was not device-verified; firmware input could change between checksum and flash. All repaired.
+- design: Crypto1 auth/read verified correct against mfoc/libnfc/proxmark: Ar/At and encrypted commands advance the LFSR with zero input; Nr feeds plaintext. `recoverKey()` remains the wrong attack (bootstrap-key samples fed to an mfkey32-style solver) and is not a proven path to a target sector key.
+- implementation: `ST25R3916::recoverKey` / `recoverAllKeys` nested acquisition, parity filter, PRNG distance calibration, 2-sample solver, fresh-auth verification; `recoverKeyDarkside` bootstrap; UI entry `RFID -> MFC Diagnostics -> Recover keys`; serial entry `rfid recover [timeout=5000]`. All paths read-only.
+- hardware-verified read: known-key read works on the physical card. 16 blocks read from sectors 0, 2, 3, 4 (`Pages: 16`, `Total pages: 64`), key A sector 0/2 `A0 A1 A2 A3 A4 A5`, sectors 3/4 `FF FF FF FF FF FF`. Evidence 20261031-003152-700640-test.
+- regression: 55-key dictionary in `RFIDInterface.h` exhausts card state after the sector 1 scan and drops the read to 4 blocks (`Pages: 4`). Reproduced twice: 20261031-195336-243098-test, 20261031-195416-117723-test. The 15-key build is the proven 16-block read.
+- build 19: VM SUCCESS, 7:36, merged image 3,864,480 bytes, SHA256 f0d992c6871f8289020b0e4e9d2bb99b041ea51527bb18feca26ead86a9429bb, artifact artifacts/Bruce-cardputer-adv-dict-20261031.bin, log /tmp/mfcbuild19.log.
+- flash: build 19 flashed and verified at 20261031-193501-337326-flash using backup 20261030-235847-413156-flash/backup-8mb.bin SHA256 4db62697140083276e114686656dc2d2f83eb5afbd4fa6559ae72402009411a8. A redundant 19:53 reflash aborted during backup at 3.6% (`Serial data stream stopped`); no write occurred.
+- unknown-key recovery: NOT proven. Sector 1 key is not in the 55-key dictionary; darkside never received a NAK; nested attack is not implemented correctly. No hardware proof that any unknown sector can be recovered.
+- next: restore the 15 proven keys or make the scan targeted; fix `_readMifareClassic` so a failed `_pollForTag` after one bad sector does not abort the remaining sectors; port mfoc `mf_enhanced_auth` mode `r` + `lfsr_recovery32` and prove it in a host test with a spec-correct card before another hardware build. If the card is hardened, report unknown sectors as unrecoverable, not success.
+- correction: `Pages` used to print total blocks (64) even when only 4 blocks read; now prints actual read count and `Total pages` separately.

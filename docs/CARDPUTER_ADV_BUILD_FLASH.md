@@ -21,7 +21,7 @@ The build produces:
 - `.pio/build/m5stack-cardputer-adv/firmware.bin` — application only; not suitable for flashing at `0x0`
 - `.pio/build/m5stack-cardputer-adv/firmware.elf` — ELF with debug symbols
 
-The CI ZIP renames the merged image to `firmware.bin` and includes `SHA256SUMS`. Builds have not been tested on a physical Cardputer ADV.
+The CI ZIP renames the merged image to `firmware.bin` and includes `SHA256SUMS`. USB smoke tests on a physical Cardputer ADV confirmed firmware identity, runtime response, ST25R3916 initialization, tag UID reads, and known-key MIFARE block reads. Unknown-key recovery is not hardware-verified; a 55-key dictionary scan currently exhausts the card and regresses the known-key read to sector 0 only.
 
 ### Build environments available
 
@@ -31,6 +31,30 @@ The CI ZIP renames the merged image to `firmware.bin` and includes `SHA256SUMS`.
 | `m5stack-cardputer-adv` | M5Stack Cardputer ADV | ST25R3916B I2C on Port A, MIFARE Classic diagnostics + key recovery |
 
 ## 2. Flash the Firmware
+
+### Saved laptop automation
+
+Run `scripts/cardputer_device.py` on the laptop with the USB-connected device, not on the build VM. Use a Python environment with `esptool` and `pyserial` installed.
+
+```bash
+# firmware.bin must be the merged image from the release ZIP or VM, not .pio's app-only image.
+python3 scripts/cardputer_device.py flash --image ./firmware.bin
+
+# Real USB serial smoke checks, ST25R3916 initialization, and a read-only tag attempt.
+python3 scripts/cardputer_device.py test --rfid
+
+# When a lab tag is present, require an actual successful tag read.
+python3 scripts/cardputer_device.py test --rfid --require-tag
+```
+
+- Auto-detects one Espressif USB port; use `--port /dev/cu.usbmodem101` (or your current port) if needed.
+- Flashing freezes the checked firmware bytes, backs up the full 8 MB, verifies that backup against flash, then writes and independently verifies the merged image at `0x0`. Configuration may reset. Use `--sha256 <expected digest>` to pin the image.
+- `--existing-backup <backup.bin>` requires this tool's adjacent `<backup.bin>.json` manifest with a matching device MAC, SHA256, and verified flag. A same-size file alone is not sufficient. Keep the original backup and manifest together for rollback.
+- Keeps private backups, logs, and JSON reports under `~/.local/state/cardputer/`; override with a **new** `--output-dir` outside the repository. Reusing an evidence directory is rejected to protect earlier backups. Backups and tag-read logs may contain credentials; keep them private.
+- `test --rfid` selects the ST25R3916 I2C module (configuration value 6), probes Grove address `0x50`, and attempts `rfid read`. It never writes, clones, or erases NFC tags.
+- Inspect BLOCKED checks in `test-result.json`. Exit 0 means no smoke checks failed, not that every feature was verified. Physical pixels, physical key presses, and unknown-key recovery are not verified by this tool.
+
+### PlatformIO upload (alternative)
 
 ```bash
 # Flash to Cardputer ADV (update the port as needed)
@@ -63,10 +87,9 @@ pio device monitor -e m5stack-cardputer-adv --port /dev/ttyUSB0 --baud 115200
 The serial monitor shows:
 - ST25R3916 initialization logs (when `ST25R_DEBUG` is enabled)
 - MIFARE Classic auth results per sector
-- Darkside key recovery progress (nonce collection, PRNG state recovery)
-- Key recovery results
+- Experimental nonce-collection logs when debugging is enabled (not proof of key recovery)
 
-Sensitive key values are **redacted** in serial output by default (only key indices are shown, not the actual key bytes).
+**Treat serial logs as sensitive.** `rfid read` and `rfid info` print stored card data, including authenticated keys when available. The USB tool saves these logs privately; it does not redact them.
 
 ## 4. Using the Diagnostic Mode
 
@@ -166,7 +189,7 @@ Then rebuild and flash. Debug output appears on the serial monitor at 115200 bau
 | "RFID module not found!" | ST25R3916 not initialized | Cardputer ADV env must be used; I2C Port A pins configured |
 | Card not detected | Card not on reader / antenna issue | Place card flat on the back of the Cardputer ADV |
 | "Failed authenticating" | Wrong key | Use a card with known default key (FFFFFFFFFFFF) |
-| Key recovery finds 0 keys | No bootstrap sector with known key | Sector 0 must be readable with FFFFFFFFFFFF or another known key |
+| Unknown-key recovery finds 0 keys | Current code does not derive unknown keys | Do not treat nonce prediction or a dictionary hit as unknown-key recovery |
 | Build fails | Missing dependencies | Run `pio lib install` first, or delete `.pio` and rebuild |
 
 ## 9. File Locations
