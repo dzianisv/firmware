@@ -716,19 +716,81 @@ void TagOMatic::load_file() {
 // Per-sector/block diagnostics for MIFARE Classic cards read via ST25R3916.
 // Shows: card type/UID, current sector/block, auth result, read result,
 // error classification, block counts. Supports cancellation and optional
-// darkside key recovery.
+// nested key recovery.
 
 #if !defined(LITE_VERSION)
 namespace {
-const char *_diagErrorClassStr(uint8_t cls) {
-    switch (cls) {
-        case 0: return "Authentication";
-        case 1: return "Timeout";
-        case 2: return "RF Communication";
-        case 3: return "Unsupported";
-        case 4: return "Internal";
-        default: return "Unknown";
+// Compact MFC screens for the 240x135 Cardputer panel. The generic
+// display_banner()/padprintln() layout is taller than the diagnostic body and
+// pushed the last lines off-screen, so diagnostics use fixed rows instead.
+void diag_begin(const char *title) {
+    drawMainBorder(true);
+    printTitle(title);
+    tft.setTextSize(FP);
+    tft.setTextDatum(0);
+}
+
+void diag_line(int y, const String &text, uint16_t color) {
+    tft.fillRect(8, y, tftWidth - 16, 10, bruceConfig.bgColor);
+    tft.setTextColor(color, bruceConfig.bgColor);
+    tft.drawString(text, 10, y);
+}
+
+void diag_line(int y, const String &text) { diag_line(y, text, bruceConfig.priColor); }
+
+void diag_bar(int y, uint8_t pct, uint16_t color) {
+    if (pct > 100) pct = 100;
+    const int x = 10;
+    const int w = tftWidth - 20;
+    const int h = 8;
+    tft.drawRect(x, y, w, h, bruceConfig.priColor);
+    const int fill = (w - 2) * pct / 100;
+    tft.fillRect(x + 1, y + 1, fill, h - 2, color);
+    if (fill < w - 2) tft.fillRect(x + 1 + fill, y + 1, w - 2 - fill, h - 2, bruceConfig.bgColor);
+}
+
+String diag_card_type(ST25R3916 *card) {
+    if (card && card->mfcType.length() > 0) return "MIFARE Classic " + card->mfcType;
+    return "MIFARE Classic";
+}
+
+int diag_count_keys(ST25R3916 *card) {
+    if (!card) return 0;
+    int n = 0;
+    for (uint8_t s = 0; s < card->mfcDump.sectors; s++) {
+        if (card->mfcDump.keyAFound[s]) n++;
+        if (card->mfcDump.keyBFound[s]) n++;
     }
+    return n;
+}
+
+void diag_card_screen(ST25R3916 *card, bool partial) {
+    diag_begin("MFC DIAGNOSTICS");
+    int y = 52;
+    diag_line(y, diag_card_type(card)); y += 11;
+    diag_line(y, "UID: " + card->printableUID.uid); y += 11;
+    diag_line(y, "Sectors: " + String(card->mfcDump.sectors) + "  Blocks: " + String(card->mfcDump.totalBlocks));
+    y += 11;
+    if (partial) {
+        diag_line(y, "No key yet - darkside ready", TFT_ORANGE);
+    } else {
+        diag_line(y, "Known keys: " + String(diag_count_keys(card)));
+    }
+    y += 11;
+    diag_line(y, "Press [OK] to start"); y += 11;
+    diag_line(y, "[ESC] cancel");
+}
+
+void diag_recovery_screen(const char *phase, unsigned done, unsigned total, ST25R3916 *card) {
+    uint8_t pct = total ? (uint8_t)((uint64_t)done * 100 / total) : 0;
+    if (pct > 100) pct = 100;
+    diag_begin("KEY RECOVERY");
+    diag_line(52, phase);
+    diag_bar(64, pct, pct >= 100 ? TFT_GREEN : bruceConfig.priColor);
+    diag_line(76, "Step " + String(pct) + "%");
+    diag_line(87, "Keys: " + String(diag_count_keys(card)));
+    diag_line(98, "Hold card steady");
+    diag_line(109, "[ESC] cancel");
 }
 } // namespace
 
@@ -745,7 +807,9 @@ void TagOMatic::diag_card() {
     if (!_diagRunning && !_diagReady) {
         // Detect/read only once; don't repeat a full dump while waiting for SEL.
         int readStatus = _rfid->read();
-        if (readStatus != RFIDInterface::SUCCESS) {
+        const bool partialMfc =
+            readStatus == RFIDInterface::FAILURE && st25r->mfcDump.sectors > 0;
+        if (readStatus != RFIDInterface::SUCCESS && !partialMfc) {
             if (check(EscPress)) {
                 _diagCancel = true;
                 set_state(READ_MODE);
@@ -753,26 +817,24 @@ void TagOMatic::diag_card() {
             }
             return; // keep waiting
         }
+        if (partialMfc) {
+            Serial.println("[TAG] MFC detected but no block readable; darkside recovery available");
+        }
 
-        // Card detected — show details and prompt to start.
-        display_banner();
-        dump_card_details();
-
+        // Card detected — show a compact summary and prompt to start.
         // Verify it's a MIFARE Classic card.
         if (!st25r->isMifareClassicSak(_rfid->uid.sak)) {
-            padprintln("");
-            padprintln("Not a MIFARE Classic card.");
-            padprintln("Type: " + _rfid->printableUID.picc_type);
-            padprintln("Diagnostics require MIFARE Classic 1K/4K/Mini.");
-            delayWithReturn(2000);
+            diag_begin("MFC DIAGNOSTICS");
+            diag_line(52, "Not a MIFARE Classic card.", TFT_RED);
+            diag_line(63, "Type: " + _rfid->printableUID.picc_type);
+            diag_line(74, "Need Classic 1K/4K/Mini.");
+            diag_line(85, "[ESC] back");
+            delayWithReturn(2500);
             set_state(READ_MODE);
             return;
         }
 
-        padprintln("");
-        padprintln("Press [SEL] to start reading.");
-        padprintln("Press [ESC] to cancel.");
-
+        diag_card_screen(st25r, partialMfc);
         _diagReady = true;
         return;
     }
@@ -792,12 +854,12 @@ void TagOMatic::diag_card() {
     // Diagnostic run in progress.
     if (_diagCancel || check(EscPress)) {
         _diagCancel = true;
-        display_banner();
-        padprintln("Diagnostic cancelled.");
-        padprintln(String("Sectors: ") + String(_diagSector) + "/" + String(st25r->mfcDump.sectors));
-        padprintln(String("Blocks OK: ") + String(_diagBlocksOk));
-        padprintln(String("Blocks FAIL: ") + String(_diagBlocksFail));
-        padprintln("Partial data — not a complete dump.");
+        diag_begin("MFC DIAGNOSTICS");
+        diag_line(52, "Diagnostic cancelled.", TFT_ORANGE);
+        diag_line(63, "Sectors: " + String(_diagSector) + "/" + String(st25r->mfcDump.sectors));
+        diag_line(74, "Blocks OK: " + String(_diagBlocksOk));
+        diag_line(85, "Blocks FAIL: " + String(_diagBlocksFail));
+        diag_line(96, "Partial data - incomplete dump.");
         delayWithReturn(1500);
         set_state(READ_MODE);
         return;
@@ -808,30 +870,26 @@ void TagOMatic::diag_card() {
 
     if (sector >= st25r->mfcDump.sectors) {
         // All sectors done.
-        display_banner();
-        padprintln("Diagnostic complete.");
-        padprintln(String("Sectors: ") + String(st25r->mfcDump.sectors));
-        padprintln(String("Blocks OK: ") + String(_diagBlocksOk) + "/" + String(st25r->mfcDump.totalBlocks));
-        padprintln(String("Blocks FAIL: ") + String(_diagBlocksFail));
         const bool complete = st25r->mfcDump.totalBlocks > 0 &&
                               _diagBlocksOk == st25r->mfcDump.totalBlocks && _diagBlocksFail == 0;
         _rfid->pageReadSuccess = complete;
         _rfid->pageReadStatus = complete ? RFIDInterface::SUCCESS : RFIDInterface::FAILURE;
-        if (complete) {
-            padprintln("Complete dump.");
-        } else {
-            padprintln("Partial data — not a complete dump.");
-        }
-        padprintln("");
-        padprintln("[SEL] Show keys   [ESC] Menu");
 
-        if (check(SelPress)) {
-            diag_printKeyTable();
-        }
-        if (check(EscPress)) {
-            set_state(READ_MODE);
-        }
-        delayWithReturn(200);
+        diag_begin("MFC DIAGNOSTICS");
+        diag_line(52, complete ? "Diagnostic complete." : "Diagnostic partial.",
+                  complete ? TFT_GREEN : TFT_ORANGE);
+        diag_line(63, "Sectors: " + String(st25r->mfcDump.sectors) + "/" +
+                          String(st25r->mfcDump.sectors));
+        diag_line(74, "Blocks OK: " + String(_diagBlocksOk) + "/" + String(st25r->mfcDump.totalBlocks));
+        diag_line(85, "Blocks FAIL: " + String(_diagBlocksFail));
+        diag_line(96, "Keys: " + String(diag_count_keys(st25r)));
+        diag_line(107, complete ? "Complete dump." : "Partial data - incomplete dump.");
+        options = {
+            {"Show keys", [this]() { diag_printKeyTable(); }},
+            {"Recover keys", [this]() { diag_recoverKeys(); }},
+            {"Menu", [this]() { set_state(READ_MODE); }},
+        };
+        loopOptions(options);
         return;
     }
 
@@ -955,34 +1013,43 @@ void TagOMatic::diag_card() {
 }
 
 void TagOMatic::diag_displaySector(uint8_t sector, uint8_t block, bool authOk, bool readOk, const char *error) {
-    display_banner();
-
     ST25R3916 *st25r = static_cast<ST25R3916 *>(_rfid);
-    padprintln(st25r->mfcType);
-    padprintln("UID: " + _rfid->printableUID.uid);
+    const uint8_t sectors = st25r->mfcDump.sectors;
+    const uint8_t nBlocks = st25r->mfcSectorBlockCount(sector);
 
-    padprintln(String("Reading: Sector ") + String(sector) + " / " + String(st25r->mfcDump.sectors));
-    padprintln(String("Block: ") + String(block));
-
-    padprintln(String("Auth: ") + (authOk ? "OK" : "Failed"));
-
+    uint32_t done = (uint32_t)_diagBlocksOk + _diagBlocksFail;
     uint16_t total = st25r->mfcDump.totalBlocks;
-    padprintln(String("Blocks: ") + String(_diagBlocksOk) + " / " + String(total));
+    uint8_t totalPct = total ? (uint8_t)((uint64_t)done * 100 / total) : 0;
+    if (totalPct > 100) totalPct = 100;
 
+    uint8_t sectorPct = 0;
+    if (authOk && nBlocks) {
+        uint8_t completed = (uint8_t)(block + 1);
+        if (completed > nBlocks) completed = nBlocks;
+        sectorPct = (uint8_t)((uint16_t)completed * 100 / nBlocks);
+    }
+
+    diag_begin("MFC DIAGNOSTICS");
+    int y = 52;
+    diag_line(y, diag_card_type(st25r)); y += 11;
+    diag_line(y, "Sec " + String(sector + 1) + "/" + String(sectors) + "  Blk " +
+                     String(block + 1) + "/" + String(nBlocks));
+    y += 11;
+    diag_bar(y, totalPct, totalPct >= 100 ? TFT_GREEN : bruceConfig.priColor);
+    y += 12;
+    diag_line(y, "Read " + String(totalPct) + "%  Sector " + String(sectorPct) + "%");
+    y += 11;
     if (error) {
-        padprintln(String("Error: ") + String(_diagErrorClassStr(_diagErrorClass)));
+        diag_line(y, String("Error: ") + error, TFT_RED);
     } else if (!authOk) {
-        padprintln("Error: Authentication");
+        diag_line(y, "Error: Authentication", TFT_RED);
     } else if (!readOk) {
-        padprintln("Error: RF Communication");
+        diag_line(y, "Error: RF Communication", TFT_RED);
+    } else {
+        diag_line(y, "Auth OK - block read OK", TFT_GREEN);
     }
-
-    padprintln("");
-    padprintln("[ESC] Cancel");
-
-    if (!authOk || !readOk) {
-        padprintln("Partial — incomplete dump");
-    }
+    y += 11;
+    diag_line(y, "[ESC] cancel");
 }
 
 void TagOMatic::diag_recoverKeys() {
@@ -995,19 +1062,34 @@ void TagOMatic::diag_recoverKeys() {
     ST25R3916 *st25r = static_cast<ST25R3916 *>(_rfid);
 
     // Card must already be read (mfcDump populated).
-    if (!st25r->mfcLoaded || st25r->mfcDump.sectors == 0) {
+    if (st25r->mfcDump.sectors == 0) {
         displayError("Read a card first.", true);
         set_state(READ_MODE);
         return;
     }
 
-    display_banner();
-    padprintln("Key Recovery (Darkside)");
-    padprintln("Sector 0 needs known key.");
-    padprintln("Bootstrap key: FFFFFFFFFFFF");
-    padprintln("");
-    padprintln("Press [SEL] to start.");
-    padprintln("Press [ESC] to cancel.");
+    int bootSec = -1;
+    for (uint8_t s = 0; s < st25r->mfcDump.sectors; s++) {
+        if (st25r->mfcDump.keyAFound[s] || st25r->mfcDump.keyBFound[s]) {
+            bootSec = s;
+            break;
+        }
+    }
+    diag_begin("KEY RECOVERY");
+    int y = 52;
+    if (bootSec < 0) {
+        Serial.println("[TAG] key recovery: no known key, darkside bootstrap");
+        diag_line(y, "No known key in dump."); y += 11;
+        diag_line(y, "Darkside sector 0."); y += 11;
+        diag_line(y, "Then nested recovery."); y += 11;
+    } else {
+        Serial.printf("[TAG] key recovery: bootstrap sector %d\n", bootSec);
+        diag_line(y, "Bootstrap sector: " + String(bootSec)); y += 11;
+        diag_line(y, "Using key already in dump."); y += 11;
+        diag_line(y, "Then nested recovery."); y += 11;
+    }
+    diag_line(y, "Press [OK] to start."); y += 11;
+    diag_line(y, "[ESC] cancel.");
 
     // Wait for user confirmation.
     while (!_diagCancel) {
@@ -1021,14 +1103,45 @@ void TagOMatic::diag_recoverKeys() {
         return;
     }
 
-    // Run darkside recovery on all sectors.
-    int recovered = st25r->recoverAllKeys();
+    // Run darkside/nested recovery. The callback updates a compact progress
+    // screen and yields so ESC stays responsive during solver buckets.
+    struct RecoveryView {
+        ST25R3916 *card;
+        uint32_t lastDraw;
+    } view{st25r, 0};
 
-    display_banner();
-    padprintln("Key recovery scan complete.");
-    padprintln(String("Sectors recovered: ") + String(recovered));
-    padprintln("Check recovered keys below.");
-    delayWithReturn(1000);
+    int recovered = st25r->recoverAllKeys(
+        [](unsigned done, unsigned total, void *context) {
+            auto *view = static_cast<RecoveryView *>(context);
+            const uint32_t now = millis();
+            const bool finished = total > 0 && done >= total;
+            if (now - view->lastDraw >= 150 || finished) {
+                view->lastDraw = now;
+                diag_recovery_screen(
+                    total == 128 ? "Darkside bootstrap" : "Nested recovery", done, total, view->card
+                );
+                delay(1);
+            }
+            return !check(EscPress);
+        },
+        &view
+    );
+
+    Serial.printf("[TAG] key recovery: result %d\n", recovered);
+    diag_begin("KEY RECOVERY");
+    if (recovered == -2) {
+        diag_line(52, "Key recovery cancelled.", TFT_ORANGE);
+    } else if (recovered == -3) {
+        diag_line(52, "Stopped: low memory.", TFT_RED);
+    } else if (recovered < 0) {
+        diag_line(52, "Stopped: card lost/auth failed.", TFT_RED);
+    } else {
+        diag_line(52, "Key recovery complete.", TFT_GREEN);
+    }
+    diag_line(63, "New keys: " + String(recovered > 0 ? recovered : 0));
+    diag_line(74, "Total keys: " + String(diag_count_keys(st25r)));
+    diag_line(85, "Showing keys...");
+    delayWithReturn(1200);
 
     diag_printKeyTable();
 }
@@ -1042,30 +1155,65 @@ void TagOMatic::diag_printKeyTable() {
     }
     ST25R3916 *st25r = static_cast<ST25R3916 *>(_rfid);
 
-    display_banner();
-    padprintln("Recovered Keys:");
-    padprintln("");
-
-    int count = 0;
+    constexpr int kRowsPerPage = 5;
+    int rows = 0;
     for (uint8_t s = 0; s < st25r->mfcDump.sectors; s++) {
-        for (int useB = 0; useB <= 1; useB++) {
-            if (!(useB ? st25r->mfcDump.keyBFound[s] : st25r->mfcDump.keyAFound[s])) continue;
-            const uint8_t *key = useB ? st25r->mfcDump.keyB[s] : st25r->mfcDump.keyA[s];
-            char line[40];
-            snprintf(line, sizeof(line), "S%u %c: %02X%02X%02X%02X%02X%02X", s, useB ? 'B' : 'A',
-                     key[0], key[1], key[2], key[3], key[4], key[5]);
-            padprintln(String(line));
-            count++;
-        }
+        if (st25r->mfcDump.keyAFound[s] || st25r->mfcDump.keyBFound[s]) rows++;
     }
+    const int pages = rows > 0 ? (rows + kRowsPerPage - 1) / kRowsPerPage : 1;
+    int page = 0;
 
-    padprintln("");
-    padprintln(String("Total: ") + String(count) + " keys recovered.");
-    padprintln("");
-    padprintln("[ESC] Menu");
+    while (true) {
+        diag_begin("RECOVERED KEYS");
+        int shown = 0;
+        int row = 0;
+        for (uint8_t s = 0; s < st25r->mfcDump.sectors && shown < kRowsPerPage; s++) {
+            const bool hasA = st25r->mfcDump.keyAFound[s];
+            const bool hasB = st25r->mfcDump.keyBFound[s];
+            if (!hasA && !hasB) continue;
+            if (row++ < page * kRowsPerPage) continue;
 
-    while (!check(EscPress)) {
-        delay(50);
+            char a[13];
+            char b[13];
+            if (hasA) {
+                snprintf(a, sizeof(a), "%02X%02X%02X%02X%02X%02X", st25r->mfcDump.keyA[s][0],
+                         st25r->mfcDump.keyA[s][1], st25r->mfcDump.keyA[s][2], st25r->mfcDump.keyA[s][3],
+                         st25r->mfcDump.keyA[s][4], st25r->mfcDump.keyA[s][5]);
+            } else {
+                snprintf(a, sizeof(a), "------------");
+            }
+            if (hasB) {
+                snprintf(b, sizeof(b), "%02X%02X%02X%02X%02X%02X", st25r->mfcDump.keyB[s][0],
+                         st25r->mfcDump.keyB[s][1], st25r->mfcDump.keyB[s][2], st25r->mfcDump.keyB[s][3],
+                         st25r->mfcDump.keyB[s][4], st25r->mfcDump.keyB[s][5]);
+            } else {
+                snprintf(b, sizeof(b), "------------");
+            }
+
+            char line[48];
+            snprintf(line, sizeof(line), "S%02u A:%s B:%s", s, a, b);
+            diag_line(52 + shown * 11, String(line));
+            shown++;
+        }
+
+        if (rows == 0) diag_line(52, "No keys recovered.");
+        diag_line(107, "Page " + String(page + 1) + "/" + String(pages));
+        diag_line(118, pages > 1 ? "[OK] next  [ESC] exit" : "[ESC] exit");
+
+        bool leave = false;
+        while (true) {
+            if (check(EscPress)) {
+                leave = true;
+                break;
+            }
+            if (check(SelPress)) {
+                if (pages > 1) page = (page + 1) % pages;
+                else leave = true;
+                break;
+            }
+            delay(50);
+        }
+        if (leave) break;
     }
     set_state(READ_MODE);
 }

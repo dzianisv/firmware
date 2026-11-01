@@ -14,7 +14,6 @@ uint8_t mfc_nonce_oddparity(uint8_t b) {
 
 uint32_t mfc_nonce_distance(uint32_t prev_nt, uint32_t next_nt, uint32_t *dist_out) {
     if (!dist_out) return 1;
-    uint32_t d = 0;
     uint32_t cur = prev_nt;
     for (uint32_t i = 1; i <= 0x10000u; i++) {
         cur = prng_successor(cur, 1);
@@ -27,25 +26,24 @@ uint32_t mfc_nonce_distance(uint32_t prev_nt, uint32_t next_nt, uint32_t *dist_o
     return 1;
 }
 
-uint8_t mfc_nonce_parity_filter_ok(uint32_t nt_plaintext, uint8_t enc_nt[4]) {
-    if (!enc_nt) return 0;
-    uint8_t ntb[4] = {(uint8_t)(nt_plaintext >> 24), (uint8_t)(nt_plaintext >> 16),
-                      (uint8_t)(nt_plaintext >> 8), (uint8_t)(nt_plaintext)};
-    Crypto1State cipher;
-    // State doesn't matter for filter_bit in general, but we need to match protocol;
-    // use a dummy init
-    cipher.odd = 0; cipher.even = 0;
-    uint8_t ok = 1;
-    for (int i = 0; i < 4; i++) {
-        uint8_t ksb = crypto1_byte(&cipher, 0, 0);
-        uint8_t enc = enc_nt[i];
-        uint8_t plain = enc ^ ksb;
-        if (plain != ntb[i]) { /* will validate */ }
-        (void)enc;
+uint8_t mfc_nonce_parity_filter_ok(uint32_t nt_plaintext, uint32_t enc_nt, const uint8_t raw_parity[3]) {
+    if (!raw_parity) return 0;
+    const uint32_t ks = nt_plaintext ^ enc_nt;
+    const uint8_t p0 = nfc_oddparity((uint8_t)(nt_plaintext >> 24));
+    const uint8_t p1 = nfc_oddparity((uint8_t)(nt_plaintext >> 16));
+    const uint8_t p2 = nfc_oddparity((uint8_t)(nt_plaintext >> 8));
+    return (p0 == (uint8_t)(raw_parity[0] ^ ((ks >> 16) & 1u))) &&
+           (p1 == (uint8_t)(raw_parity[1] ^ ((ks >> 8) & 1u))) &&
+           (p2 == (uint8_t)(raw_parity[2] ^ (ks & 1u)));
+}
+
+void mfc_nonce_encrypt_trail(uint32_t key_state_odd, uint32_t key_state_even, const uint8_t *plain,
+                             uint8_t *enc_out, uint8_t *par_out, size_t len) {
+    Crypto1State state = {key_state_odd, key_state_even};
+    for (size_t i = 0; i < len; i++) {
+        enc_out[i] = (uint8_t)(crypto1_byte(&state, 0, 0) ^ plain[i]);
+        if (par_out) par_out[i] = (uint8_t)(crypto1_filter_bit(&state) ^ nfc_oddparity(plain[i]));
     }
-    // Check first 3 encrypted parity bits: oddparity(plaintextByte[i]) XOR keystream first bit of next byte
-    // We need keystream bit - use filter logic approximation is fine if using our crypto1
-    return 1; // placeholder, real check done in context
 }
 
 }

