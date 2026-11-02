@@ -3656,10 +3656,11 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
 
         bool authed = false;
         bool usedKeyB = false;
+        bool cardLost = false;
         uint8_t usedKeyBytes[6] = {0};
 
         // Try Key A then Key B from the builtin dictionary.
-        for (int useB = 0; useB <= 1 && !authed; useB++) {
+        for (int useB = 0; useB <= 1 && !authed && !cardLost; useB++) {
             for (int kidx = 0; kidx < nKeys; kidx++) {
                 if (_mifareAuth(trailer, keys[kidx], useB != 0)) {
                     authed = true;
@@ -3672,9 +3673,11 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
                 delay(5);
                 rfalNfcDevice *d2 = nullptr;
                 if (!_pollForTag(&d2, 500)) {
-                    _mfcRebuildStrAllPages();
-                    pageReadStatus = FAILURE;
-                    return FAILURE;
+                    // The card dropped out after a failed auth. Do not abort the
+                    // whole read: try to reselect once and move on to the next
+                    // sector, so one exhausted sector cannot hide the rest.
+                    cardLost = true;
+                    break;
                 }
                 _parseDevice(d2);
                 _mfcAuthed = false;
@@ -3682,8 +3685,8 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
         }
 
         // Fallback: try user keys from bruceConfig.mifareKeys (custom dictionary).
-        if (!authed) {
-            for (int useB = 0; useB <= 1 && !authed; useB++) {
+        if (!authed && !cardLost) {
+            for (int useB = 0; useB <= 1 && !authed && !cardLost; useB++) {
                 for (const auto &mifKey : bruceConfig.mifareKeys) {
                     uint8_t k[6];
                     for (int i = 0; i < 6; i++)
@@ -3699,9 +3702,8 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
                     delay(5);
                     rfalNfcDevice *d2 = nullptr;
                     if (!_pollForTag(&d2, 500)) {
-                        _mfcRebuildStrAllPages();
-                        pageReadStatus = FAILURE;
-                        return FAILURE;
+                        cardLost = true;
+                        break;
                     }
                     _parseDevice(d2);
                     _mfcAuthed = false;
@@ -3709,101 +3711,54 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
             }
         }
 
+        if (cardLost) {
+            if (!mfcReselect(3000)) {
+                ST25R_LOG("mfc read: card lost at sector %u", s);
+                break;
+            }
+            ST25R_LOG("mfc read: reselected after failed scan of sector %u", s);
+            continue;
+        }
+
         if (!authed) {
-            // Dictionary failed; use any known key as bootstrap and try the
-            // missing key type for this sector.
-            int bootSec = -1;
-            bool bootB = false;
-            for (uint8_t bs = 0; bs < mfcDump.sectors; bs++) {
-                if (mfcDump.keyAFound[bs]) {
-                    bootSec = bs;
-                    bootB = false;
-                    break;
-                }
-                if (mfcDump.keyBFound[bs]) {
-                    bootSec = bs;
-                    bootB = true;
-                    break;
-                }
-            }
-            if (bootSec >= 0) {
-                const uint8_t knownBlock = (uint8_t)(_mfcSectorFirstBlock((uint8_t)bootSec) +
-                                                     _mfcSectorBlockCount((uint8_t)bootSec) - 1);
-                uint8_t knownKey[6];
-                memcpy(knownKey, bootB ? mfcDump.keyB[bootSec] : mfcDump.keyA[bootSec], 6);
-                auto progress = [](unsigned done, unsigned total, void *) {
-                    static uint32_t lastYield = 0;
-                    const uint32_t now = millis();
-                    if (now - lastYield >= 100) {
-                        lastYield = now;
-                        delay(1);
-                    }
-                    if (done != 0 && (done & 0x0F) == 0) {
-                        ST25R_LOG_SCREEN("Nested %u/%u", done, total);
-                    }
-                    return !check(EscPress);
-                };
-                ST25R_LOG_SCREEN(">>> NESTED sector %u — key recovery…", s);
-                for (int targetB = 0; targetB <= 1 && !authed; targetB++) {
-                    if (targetB ? mfcDump.keyBFound[s] : mfcDump.keyAFound[s]) continue;
-                    uint8_t recoveredKey[6] = {0};
-                    auto res = recoverKey(
-                        knownBlock, knownKey, bootB, trailer, targetB != 0, recoveredKey, progress
-                    );
-                    ST25R_RECOVERY_LOG(
-                        "auto recover sector %u key %c -> %s", s, targetB ? 'B' : 'A',
-                        recoveryStatus(res)
-                    );
-                    if (res == RecoveryResult::Cancelled) {
-                        _mfcHalt();
-                        _mfcAuthed = false;
-                        _nfc->rfalNfcDeactivate(false);
-                        _mfcRebuildStrAllPages();
-                        pageReadStatus = FAILURE;
-                        return FAILURE;
-                    }
-                    if (res == RecoveryResult::Verified || res == RecoveryResult::AlreadyKnown) {
-                        memcpy(usedKeyBytes, recoveredKey, 6);
-                        usedKeyB = targetB != 0;
-                        authed = true;
-                    }
-                }
-            }
-            if (!authed) {
-                _mfcHalt();
-                _nfc->rfalNfcDeactivate(false);
-                delay(5);
-                rfalNfcDevice *d2 = nullptr;
-                if (s + 1 < mfcDump.sectors) {
-                    if (!_pollForTag(&d2, 500)) break;
-                    _parseDevice(d2);
-                    _mfcAuthed = false;
-                }
-                continue;
-            }
-            // Re-authenticate with recovered key so cipher state is set for block reads.
-            if (!mfcReselect(5000)) {
-                _mfcHalt();
+            // Dictionary failed. Do not run an unproven cryptographic attack
+            // inside an ordinary read: it is slow, exhausts the card's auth
+            // state, and can hide the sectors that do have known keys.
+            // Explicit recovery is `rfid recover`, which reports its own result.
+            ST25R_LOG("mfc read: sector %u has no dictionary key, skipped", s);
+            _mfcHalt();
+            _nfc->rfalNfcDeactivate(false);
+            delay(5);
+            rfalNfcDevice *d2 = nullptr;
+            if (s + 1 < mfcDump.sectors) {
+                if (!_pollForTag(&d2, 500)) break;
+                _parseDevice(d2);
                 _mfcAuthed = false;
-                rfalNfcDevice *d2 = nullptr;
-                if (s + 1 < mfcDump.sectors) {
-                    if (!_pollForTag(&d2, 500)) break;
-                    _parseDevice(d2);
-                    _mfcAuthed = false;
-                }
-                continue;
             }
-            if (!_mifareAuth(trailer, usedKeyBytes, usedKeyB)) {
-                _mfcHalt();
+            continue;
+        }
+        // Re-authenticate with the dictionary key so cipher state is set for block reads.
+        if (!mfcReselect(5000)) {
+            _mfcHalt();
+            _mfcAuthed = false;
+            rfalNfcDevice *d2 = nullptr;
+            if (s + 1 < mfcDump.sectors) {
+                if (!_pollForTag(&d2, 500)) break;
+                _parseDevice(d2);
                 _mfcAuthed = false;
-                rfalNfcDevice *d2 = nullptr;
-                if (s + 1 < mfcDump.sectors) {
-                    if (!_pollForTag(&d2, 500)) break;
-                    _parseDevice(d2);
-                    _mfcAuthed = false;
-                }
-                continue;
             }
+            continue;
+        }
+        if (!_mifareAuth(trailer, usedKeyBytes, usedKeyB)) {
+            _mfcHalt();
+            _mfcAuthed = false;
+            rfalNfcDevice *d2 = nullptr;
+            if (s + 1 < mfcDump.sectors) {
+                if (!_pollForTag(&d2, 500)) break;
+                _parseDevice(d2);
+                _mfcAuthed = false;
+            }
+            continue;
         }
 
         if (usedKeyB) {
