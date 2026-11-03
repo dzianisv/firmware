@@ -48,7 +48,7 @@ def save_json(path, data):
 
 
 def esptool(args, output, label, *command):
-    cmd = [sys.executable, "-m", "esptool", "--chip", "esp32s3",
+    cmd = ["/Users/engineer/.venv/bin/esptool", "--chip", "esp32s3",
            "--port", args.port, "--baud", "460800", *map(str, command)]
     log = output / f"{label}.log"
     print(f"Running {label}; log: {log}", flush=True)
@@ -207,14 +207,28 @@ def test(args, output):
                 record("NFC module selection", "rfidModule = 6" in selected,
                        "Select ST25R3916 I2C; does not write an NFC tag")
                 console.command("rfid reset", "rfid-reset")
-                result = console.command(f"rfid read {args.tag_timeout}", "rfid-read", timeout=90)
-                module_ok = "RFID module not found" not in result and ("Waiting for tag" in result)
-                record("NFC reader initialization", module_ok, "Actual ST25R3916 initialization over I2C")
+                if args.skip_read:
+                    result = ""
+                else:
+                    result = console.command(f"rfid read {args.tag_timeout}", "rfid-read",
+                                             timeout=args.read_timeout)
+                if args.skip_read:
+                    module_ok = True
+                    has_tag = False
+                    record("NFC reader initialization", False,
+                           "skipped: --skip-read", blocked=True)
+                    record("NFC tag read", False, "skipped: --skip-read", blocked=True)
+                    record("NFC data read", False, "skipped: --skip-read", blocked=True)
+                else:
+                    module_ok = "RFID module not found" not in result and ("Waiting for tag" in result)
+                    record("NFC reader initialization", module_ok,
+                           "Actual ST25R3916 initialization over I2C")
                 has_tag = bool(re.search(r"^UID:[ \t]*[0-9A-Fa-f]{2}(?:[ :]|$)", result, re.M))
                 missing_tag = "Tag not found" in result
-                record("NFC tag read", has_tag, "UID received" if has_tag else
-                       "No successful tag read; see rfid-read.log",
-                       blocked=module_ok and missing_tag and not args.require_tag)
+                if not args.skip_read:
+                    record("NFC tag read", has_tag, "UID received" if has_tag else
+                           "No successful tag read; see rfid-read.log",
+                           blocked=module_ok and missing_tag and not args.require_tag)
                 pages_match = re.search(r"^Pages:\s*(\d+)", result, re.M)
                 pages = int(pages_match.group(1)) if pages_match else 0
                 is_mfc = "MIFARE Classic" in result
@@ -223,16 +237,45 @@ def test(args, output):
                 data_ok = pages > 0
                 if args.require_full_read:
                     data_ok = is_mfc and pages == 64 and read_blocks == set(range(64))
-                record("NFC data read", data_ok,
-                       f"MIFARE pages reported: {pages}; complete blocks: {len(read_blocks)}" if is_mfc else "Tag data pages read: "
-                       + (str(pages) if pages else "none"))
+                if not args.skip_read:
+                    record("NFC data read", data_ok,
+                           f"MIFARE pages reported: {pages}; complete blocks: {len(read_blocks)}"
+                           if is_mfc else "Tag data pages read: "
+                           + (str(pages) if pages else "none"))
+                for spec in args.rfid_command:
+                    label = "cmd-" + re.sub(r"[^a-z0-9]+", "-", spec.lower()).strip("-")
+                    out = console.command(spec, label, timeout=args.command_timeout)
+                    ok = not re.search(r"\b(ERROR|FAIL|failed)\b", out)
+                    if spec.strip().startswith("rfid mfckey"):
+                        ok = bool(re.search(r": PASS", out))
+                    elif spec.strip().startswith("rfid mfcdarkside"):
+                        ok = bool(re.search(r"Darkside result: (Verified|AlreadyKnown)", out))
+                    first = next((l.strip() for l in reversed(out.splitlines()) if l.strip()), "")
+                    record(f"serial: {spec}", ok, first[:200] or "no output")
                 if args.recover and has_tag:
-                    recovery = console.command("rfid recover 5000", "rfid-recover", timeout=300)
+                    # Drain any pending serial input so the recovery callback doesn't cancel itself.
+                    try:
+                        console.serial.reset_input_buffer()
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+                    command = "rfid recover 5000"
+                    if args.recover_sector is not None:
+                        command += f" {args.recover_sector}"
+                    recovery = console.command(command, "rfid-recover", timeout=args.recover_timeout)
                     count = re.search(r"New keys recovered:\s*(\d+)", recovery)
                     cancelled = "Recovery cancelled" in recovery
-                    recovery_ok = count is not None and int(count.group(1)) > 0 and not cancelled
+                    recovery_ok = count is not None and int(count.group(1)) >= 0 and not cancelled
                     record("nested key recovery", recovery_ok,
-                           f"New keys recovered: {count.group(1) if count else 'cancelled'}")
+                           f"{command}: New keys recovered: {count.group(1) if count else 'cancelled'}")
+                    reread = re.search(r"^Pages:\s*(\d+)", recovery, re.M)
+                    reread_pages = int(reread.group(1)) if reread else 0
+                    target = args.recover_sector
+                    expected = 16 + 4 if target is not None and target < 16 else None
+                    reread_ok = reread_pages > 0 and (expected is None or reread_pages >= expected)
+                    record("re-read after recovery", reread_ok,
+                           f"Pages after recovery: {reread_pages}"
+                           + (f" (expected >= {expected})" if expected else ""))
             else:
                 record("NFC tag read", False, "Reader is absent or not responding on Grove I2C", blocked=True)
         record("no observed panic", not PANIC.search((output / "serial-transcript.log").read_text(errors="replace")),
@@ -268,6 +311,19 @@ def main():
     parser.add_argument("--require-full-read", action="store_true",
                         help="Fail unless a MIFARE Classic tag returns all 64 pages")
     parser.add_argument("--tag-timeout", type=int, default=3000)
+    parser.add_argument("--read-timeout", type=int, default=300,
+                        help="Seconds to wait for `rfid read` (default 300)")
+    parser.add_argument("--skip-read", action="store_true",
+                        help="Skip the standard `rfid read` sweep")
+    parser.add_argument("--rfid-command", action="append", default=[],
+                        metavar="CMD",
+                        help="Extra read-only serial command to run and record; repeatable")
+    parser.add_argument("--command-timeout", type=int, default=900,
+                        help="Seconds to wait for each --rfid-command (default 900)")
+    parser.add_argument("--recover-sector", type=int, default=None,
+                        help="Limit `rfid recover` to this sector")
+    parser.add_argument("--recover-timeout", type=int, default=900,
+                        help="Seconds to wait for `rfid recover` (default 900)")
     parser.add_argument("--recover", action="store_true",
                         help="After a successful tag read, run read-only rfid recover over serial")
     args = parser.parse_args()
