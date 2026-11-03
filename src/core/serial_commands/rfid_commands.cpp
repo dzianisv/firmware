@@ -10,7 +10,7 @@
 
 // Common workflows via serial:
 //   Read a tag:                    rfid read [timeout=5000]
-//   Recover unknown MFC keys:      rfid recover [timeout=5000]
+//   Recover unknown MFC keys:      rfid recover [timeout=5000] [sector]
 //   Emulate NDEF over ISO14443-4:  rfid emulate t4t [url|text <value>]
 //   Emulate over FeliCa:           rfid emulate felica
 //   Emulate from a saved file:     rfid loadfile [filepath] -> rfid emulate [t4t|felica]
@@ -378,8 +378,9 @@ uint32_t rfidAutotestCallback(cmd *c) {
 }
 
 #if !defined(LITE_VERSION)
-// rfid recover [timeout=5000]
-// Read-only: dictionary scan, darkside bootstrap if no key is known, then nested recovery.
+// rfid recover [timeout=5000] [sector]
+// Read-only: dictionary scan, darkside bootstrap if no key is known, then nested
+// recovery. With a sector argument only that sector is attacked.
 uint32_t rfidRecoverCallback(cmd *c) {
     Command cmd(c);
     uint32_t timeout_ms = _argTimeout(cmd);
@@ -431,22 +432,25 @@ uint32_t rfidRecoverCallback(cmd *c) {
         );
     }
 
-    int recovered = st25r->recoverAllKeys(
-        [](unsigned done, unsigned total, void *) {
-            static unsigned last = 0;
-            if (done != last && (done & 0x1F) == 0) {
-                last = done;
-                serialDevice->println("Recovering: " + String(done) + "/" + String(total));
-            }
-            if (serialDevice->available() && serialDevice->read() == 'q') {
-                serialDevice->println("Recovery cancelled by serial input.");
-                return false;
-            }
-            delay(1);
-            return true;
-        },
-        nullptr
-    );
+    auto progress = [](unsigned done, unsigned total, void *) {
+        static unsigned last = 0;
+        if (done != last && (done & 0x1F) == 0) {
+            last = done;
+            serialDevice->println("Recovering: " + String(done) + "/" + String(total));
+        }
+        if (serialDevice->available() && serialDevice->read() == 'q') {
+            serialDevice->println("Recovery cancelled by serial input.");
+            return false;
+        }
+        delay(1);
+        return true;
+    };
+
+    const String sectorValue = cmd.getArgument("sector").getValue();
+    const bool oneSector = sectorValue.length() > 0 && sectorValue.toInt() >= 0;
+    const int recovered = oneSector
+                              ? st25r->recoverSectorKeys((uint8_t)sectorValue.toInt(), progress, nullptr)
+                              : st25r->recoverAllKeys(progress, nullptr);
 
     if (recovered == -2) {
         serialDevice->println("Recovery cancelled.");
@@ -476,7 +480,171 @@ uint32_t rfidRecoverCallback(cmd *c) {
             );
         }
     }
+
+    if (recovered > 0) {
+        // Prove the recovered keys: a fresh read re-authenticates with them and
+        // must now return more pages than the dictionary-only pass.
+        serialDevice->println("Re-reading with recovered keys...");
+        const int again = _readTagWithTimeout(timeout_ms);
+        if (again == RFIDInterface::SUCCESS) {
+            _printTagInfo();
+        } else {
+            serialDevice->println("Re-read failed: " + _rfid->statusMessage(again));
+        }
+    }
     return recovered >= 0;
+}
+
+// rfid mfckey <block> <A|B> <12-hex-key>
+// Read-only single-key test. Prints PASS/FAIL only, never the key.
+uint32_t rfidMfcKeyCallback(cmd *c) {
+    Command cmd(c);
+    if (cmd.countArgs() < 3) {
+        serialDevice->println("Usage: rfid mfckey <block> <A|B> <12-hex-key>");
+        return false;
+    }
+    const int block = cmd.getArgument(0).getValue().toInt();
+    const String keyType = cmd.getArgument(1).getValue();
+    String hex = cmd.getArgument(2).getValue();
+    hex.trim();
+    hex.replace(" ", "");
+    if (block < 0 || block > 255 || hex.length() != 12) {
+        serialDevice->println("ERROR: block 0-255 and a 12-hex-character key are required");
+        return false;
+    }
+    uint8_t key[6];
+    for (int i = 0; i < 6; i++) {
+        key[i] = (uint8_t)strtoul(hex.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
+    }
+    if (!_ensureRfid()) return false;
+    if (bruceConfigPins.rfidModule != ST25R3916_SPI_MODULE &&
+        bruceConfigPins.rfidModule != ST25R3916_I2C_MODULE) {
+        serialDevice->println("ERROR: key test requires the ST25R3916 module");
+        return false;
+    }
+    ST25R3916 *st25r = static_cast<ST25R3916 *>(_rfid);
+    serialDevice->println("Place tag on reader...");
+    if (!st25r->selectMifareClassic(5000, true)) {
+        serialDevice->println("Read failed: tag not found");
+        return false;
+    }
+    const bool useB = keyType.equalsIgnoreCase("B");
+    const bool ok = st25r->mfcAuthTest((uint8_t)block, key, useB);
+    serialDevice->println(
+        String("Key ") + (useB ? "B" : "A") + " block " + String(block) + ": " +
+        (ok ? "PASS" : "FAIL")
+    );
+    return ok;
+}
+
+// rfid mfcmeasure <block> <A|B> <12-hex-key>
+// Read-only PRNG probe. One session, repeated nested auths, prints nonces.
+uint32_t rfidMfcMeasureCallback(cmd *c) {
+    Command cmd(c);
+    if (cmd.countArgs() < 3) {
+        serialDevice->println("Usage: rfid mfcmeasure <block> <A|B> <12-hex-key>");
+        return false;
+    }
+    const int block = cmd.getArgument(0).getValue().toInt();
+    const String keyType = cmd.getArgument(1).getValue();
+    String hex = cmd.getArgument(2).getValue();
+    hex.trim();
+    hex.replace(" ", "");
+    if (block < 0 || block > 255 || hex.length() != 12) {
+        serialDevice->println("ERROR: block 0-255 and a 12-hex-character key are required");
+        return false;
+    }
+    uint8_t key[6];
+    for (int i = 0; i < 6; i++) {
+        key[i] = (uint8_t)strtoul(hex.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
+    }
+    if (!_ensureRfid()) return false;
+    if (bruceConfigPins.rfidModule != ST25R3916_SPI_MODULE &&
+        bruceConfigPins.rfidModule != ST25R3916_I2C_MODULE) {
+        serialDevice->println("ERROR: PRNG probe requires the ST25R3916 module");
+        return false;
+    }
+    ST25R3916 *st25r = static_cast<ST25R3916 *>(_rfid);
+    serialDevice->println("Place tag on reader...");
+    if (!st25r->selectMifareClassic(5000, true)) {
+        serialDevice->println("Read failed: tag not found");
+        return false;
+    }
+    uint32_t dist = 0;
+    const auto res = st25r->mfcMeasureDistance(
+        (uint8_t)block, key, keyType.equalsIgnoreCase("B"), &dist
+    );
+    serialDevice->println(String("PRNG result: ") + ST25R3916::recoveryStatus(res));
+    serialDevice->println("PRNG step: " + String(dist));
+    return res == ST25R3916::RecoveryResult::Verified;
+}
+
+// rfid mfcstatic <knownBlock> <A|B> <keyhex> <targetBlock> <A|B>
+// Static-nonce key recovery. Read-only: auth attempts only, no writes.
+uint32_t rfidMfcStaticCallback(cmd *c) {
+    Command cmd(c);
+    if (cmd.countArgs() < 5) {
+        serialDevice->println(
+            "Usage: rfid mfcstatic <knownBlock> <A|B> <12-hex-key> <targetBlock> <A|B>"
+        );
+        return false;
+    }
+    const int knownBlock = cmd.getArgument(0).getValue().toInt();
+    const String knownType = cmd.getArgument(1).getValue();
+    String hex = cmd.getArgument(2).getValue();
+    const int targetBlock = cmd.getArgument(3).getValue().toInt();
+    const String targetType = cmd.getArgument(4).getValue();
+    hex.trim();
+    hex.replace(" ", "");
+    if (knownBlock < 0 || knownBlock > 255 || targetBlock < 0 || targetBlock > 255 ||
+        hex.length() != 12) {
+        serialDevice->println("ERROR: blocks 0-255 and a 12-hex-character key are required");
+        return false;
+    }
+    uint8_t key[6];
+    for (int i = 0; i < 6; i++) {
+        key[i] = (uint8_t)strtoul(hex.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
+    }
+    if (!_ensureRfid()) return false;
+    if (bruceConfigPins.rfidModule != ST25R3916_SPI_MODULE &&
+        bruceConfigPins.rfidModule != ST25R3916_I2C_MODULE) {
+        serialDevice->println("ERROR: static recovery requires the ST25R3916 module");
+        return false;
+    }
+    ST25R3916 *st25r = static_cast<ST25R3916 *>(_rfid);
+    serialDevice->println("Place tag on reader...");
+    if (!st25r->selectMifareClassic(5000, true)) {
+        serialDevice->println("Read failed: tag not found");
+        return false;
+    }
+    uint8_t recovered[6] = {0};
+    auto progress = [](unsigned done, unsigned total, void *) {
+        static unsigned last = 0;
+        if (done != last) {
+            last = done;
+            serialDevice->println("Trying keys: " + String(done) + "/" + String(total));
+        }
+        if (serialDevice->available() && serialDevice->read() == 'q') return false;
+        return true;
+    };
+    const auto res = st25r->recoverKeyStaticNonce(
+        (uint8_t)knownBlock,
+        key,
+        knownType.equalsIgnoreCase("B"),
+        (uint8_t)targetBlock,
+        targetType.equalsIgnoreCase("B"),
+        recovered,
+        progress,
+        nullptr
+    );
+    serialDevice->println(String("Static result: ") + ST25R3916::recoveryStatus(res));
+    if (res == ST25R3916::RecoveryResult::Verified) {
+        // Printed only so the operator can re-test it; the caller redacts logs.
+        char buf[13];
+        for (int i = 0; i < 6; i++) snprintf(buf + i * 2, 3, "%02X", recovered[i]);
+        serialDevice->println(String("Recovered key: ") + buf);
+    }
+    return res == ST25R3916::RecoveryResult::Verified;
 }
 
 // rfid mfcdarkside <block=4> [A|B]
@@ -593,10 +761,27 @@ void createRfidCommands(SimpleCLI *cli) {
 #if !defined(LITE_VERSION)
     Command recoverCmd = cmd.addCommand("recover", rfidRecoverCallback);
     recoverCmd.addPosArg("timeout", "5000");
+    recoverCmd.addPosArg("sector", "-1");
+
+    Command mfcKeyCmd = cmd.addCommand("mfckey", rfidMfcKeyCallback);
+    mfcKeyCmd.addPosArg("block", "7");
+    mfcKeyCmd.addPosArg("keyType", "A");
+    mfcKeyCmd.addPosArg("key", "");
 
     Command mfcDarksideCmd = cmd.addCommand("mfcdarkside", rfidMfcDarksideCallback);
     mfcDarksideCmd.addPosArg("block", "4");
     mfcDarksideCmd.addPosArg("keyType", "A");
+
+    Command mfcMeasureCmd = cmd.addCommand("mfcmeasure", rfidMfcMeasureCallback);
+    mfcMeasureCmd.addPosArg("block", "0");
+    mfcMeasureCmd.addPosArg("keyType", "A");
+    mfcMeasureCmd.addPosArg("key", "");
+
+    Command mfcStaticCmd = cmd.addCommand("mfcstatic", rfidMfcStaticCallback);
+    mfcStaticCmd.addPosArg("knownBlock", "0");
+    mfcStaticCmd.addPosArg("knownKeyType", "A");    mfcStaticCmd.addPosArg("knownKey", "A0A1A2A3A4A5");
+    mfcStaticCmd.addPosArg("targetBlock", "7");
+    mfcStaticCmd.addPosArg("targetKeyType", "A");
 
     Command mfcDiagCmd = cmd.addCommand("mfcdiag", rfidMfcDiagCallback);
     mfcDiagCmd.addPosArg("key", "");

@@ -159,23 +159,73 @@ void rollback(Crypto1State &s, uint32_t input) {
         s.even |= parity(feedback) << 23;
     }
 }
-bool verify(Crypto1State state, uint32_t uid, const Sample &first, const Sample &second,
-            uint8_t key[6]) {
-    rollback(state, uid ^ second.nt);
-    Crypto1State a = state, b = state;
-    if (crypto1_word(&a, uid ^ first.nt, 0) != (first.nt ^ first.encrypted) ||
-        crypto1_word(&b, uid ^ second.nt, 0) != (second.nt ^ second.encrypted)) return false;
+void toKey(const Crypto1State &state, uint8_t key[6]) {
     uint64_t value = 0;
     for (int i = 23; i >= 0; --i) {
         value = (value << 1) | ((state.odd >> (i ^ 3)) & 1u);
         value = (value << 1) | ((state.even >> (i ^ 3)) & 1u);
     }
     for (unsigned i = 0; i < 6; ++i) key[i] = uint8_t(value >> ((5 - i) * 8));
+}
+
+bool verify(Crypto1State state, uint32_t uid, const Sample &first, const Sample &second,
+            uint8_t key[6]) {
+    rollback(state, uid ^ second.nt);
+    Crypto1State a = state, b = state;
+    if (crypto1_word(&a, uid ^ first.nt, 0) != (first.nt ^ first.encrypted) ||
+        crypto1_word(&b, uid ^ second.nt, 0) != (second.nt ^ second.encrypted)) return false;
+    toKey(state, key);
     return true;
 }
 
+// Which sample the search is built around, and how a hit is reported.
+// `first == nullptr` selects static-nonce mode: one sample only, every
+// consistent key goes to `sink`.
+struct Target {
+    const Sample *first = nullptr;
+    const Sample *second = nullptr;
+    int parity = -1; // -1 = ignore the transmitted parity bits
+    CandidateSink sink = nullptr;
+    void *context = nullptr;
+};
+
+uint8_t oddParityBit(uint8_t b) {
+    b ^= b >> 4;
+    b ^= b >> 2;
+    b ^= b >> 1;
+    return (uint8_t)((b & 1u) ^ 1u);
+}
+
+// Same bit order as crypto1_word, but also returns the keystream bit that
+// rides on each of the first three transmitted parity bits.
+uint32_t wordWithParity(Crypto1State *s, uint32_t in, uint8_t par[3]) {
+    uint32_t ret = 0;
+    for (int i = 0; i < 32; i++) {
+        ret |= (uint32_t)crypto1_bit(s, (uint8_t)((in >> (24 ^ i)) & 1u), 0) << (24 ^ i);
+        if ((i & 7) == 7 && i < 24) par[i >> 3] = crypto1_filter_bit(s);
+    }
+    return ret;
+}
+
+bool verifyOne(Crypto1State state, uint32_t uid, const Target &t, uint8_t key[6]) {
+    const Sample &sample = *t.second;
+    rollback(state, uid ^ sample.nt);
+    Crypto1State k = state, b = state;
+    uint8_t par[3] = {0, 0, 0};
+    if (wordWithParity(&b, uid ^ sample.nt, par) != (sample.nt ^ sample.encrypted)) return false;
+    if (t.parity >= 0) {
+        for (int i = 0; i < 3; i++) {
+            const uint8_t byte = (uint8_t)(sample.nt >> (24 - 8 * i));
+            if ((uint8_t)(par[i] ^ oddParityBit(byte)) != (uint8_t)((t.parity >> i) & 1u))
+                return false;
+        }
+    }
+    toKey(k, key);
+    return t.sink ? t.sink(key, t.context) : true;
+}
+
 Result join(Scratch &scratch, unsigned bucket, uint32_t oks, uint32_t eks, uint32_t input,
-            uint32_t uid, const Sample &first, const Sample &second, uint8_t key[6], Control &control) {
+            uint32_t uid, const Target &t, uint8_t key[6], Control &control) {
     unsigned counts[2] = {scratch.counts[0][bucket], scratch.counts[1][bucket]};
     for (unsigned side = 0; side < 2; ++side) {
         if (counts[side] > WorkCapacity) return Result::Overflow;
@@ -208,7 +258,8 @@ Result join(Scratch &scratch, unsigned bucket, uint32_t oks, uint32_t eks, uint3
                 if (!control.tick()) return Result::Cancelled;
                 const uint32_t od = scratch.work[0][i];
                 Crypto1State state{advanced ^ parity(od & OddPoly), od};
-                if (verify(state, uid, first, second, key)) return Result::Found;
+                if (t.first ? verify(state, uid, *t.first, *t.second, key)
+                            : verifyOne(state, uid, t, key)) return Result::Found;
             }
         }
         o = oe;
@@ -217,8 +268,8 @@ Result join(Scratch &scratch, unsigned bucket, uint32_t oks, uint32_t eks, uint3
     return Result::NotFound;
 }
 
-Result search(Scratch &scratch, uint32_t uid, const Sample &first, const Sample &second,
-              uint8_t key[6], Control &control) {
+Result search(Scratch &scratch, uint32_t uid, const Target &t, uint8_t key[6], Control &control) {
+    const Sample &second = *t.second;
     const uint32_t ks = second.nt ^ second.encrypted;
     uint32_t oks = 0, eks = 0;
     for (int i = 31; i >= 1; i -= 2) oks = (oks << 1) | ((ks >> (i ^ 24)) & 1u);
@@ -240,8 +291,7 @@ Result search(Scratch &scratch, uint32_t uid, const Sample &first, const Sample 
         }
         for (unsigned bucket = 0; bucket < Batch; ++bucket) {
             if (!control.poll()) return Result::Cancelled;
-            const Result r = join(scratch, bucket, oks, eks, input >> 16,
-                                  uid, first, second, key, control);
+            const Result r = join(scratch, bucket, oks, eks, input >> 16, uid, t, key, control);
             if (r != Result::NotFound) return r;
             ++control.completed;
         }
@@ -277,13 +327,28 @@ Result recover(uint32_t uid, const Sample &first, const Sample &second, uint8_t 
 #endif
     if (!scratch) return Result::NoMemory;
     uint8_t candidate[6];
-    const Result result = search(*scratch, uid, first, second, candidate, control);
+    Target target{&first, &second, -1, nullptr, nullptr};
+    const Result result = search(*scratch, uid, target, candidate, control);
 #ifdef MFC_RECOVERY_TESTING
     test_release(scratch);
 #else
     free_scratch(scratch);
 #endif
     if (result == Result::Found) std::memcpy(key, candidate, sizeof(candidate));
+    return result;
+}
+
+Result enumerateKeys(uint32_t uid, const Sample &sample, int parity, CandidateSink sink,
+                     void *context, Progress progress, void *progressContext) {
+    if (!sink) return Result::InvalidInput;
+    Control control{progress, progressContext};
+    if (!control.poll()) return Result::Cancelled;
+    Scratch *scratch = static_cast<Scratch *>(alloc_scratch(sizeof(Scratch)));
+    if (!scratch) return Result::NoMemory;
+    uint8_t candidate[6];
+    Target target{nullptr, &sample, parity, sink, context};
+    const Result result = search(*scratch, uid, target, candidate, control);
+    free_scratch(scratch);
     return result;
 }
 } // namespace mfc_recovery

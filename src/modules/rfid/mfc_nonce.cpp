@@ -14,6 +14,12 @@ uint8_t mfc_nonce_oddparity(uint8_t b) {
 
 uint32_t mfc_nonce_distance(uint32_t prev_nt, uint32_t next_nt, uint32_t *dist_out) {
     if (!dist_out) return 1;
+    // A static-PRNG card repeats the same nonce. That is distance 0, not a full
+    // 65535-step cycle.
+    if (prev_nt == next_nt) {
+        *dist_out = 0;
+        return 0;
+    }
     uint32_t cur = prev_nt;
     for (uint32_t i = 1; i <= 0x10000u; i++) {
         cur = prng_successor(cur, 1);

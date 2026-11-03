@@ -29,4 +29,13 @@ using Progress = bool (*)(unsigned completed, unsigned total, void *context);
 // Found verifies both samples, but two samples do not mathematically guarantee uniqueness.
 Result recover(uint32_t uid, const Sample &first, const Sample &second, uint8_t key[6],
                Progress progress = nullptr, void *context = nullptr);
+
+// Static-nonce cards repeat one nonce forever, so only a single keystream
+// window is ever available and the key is underdetermined (2^16 states before
+// parity). Offer every key consistent with `sample` and the three transmitted
+// nonce parity bits to `sink`. sink returns true to accept a candidate, which
+// stops the search. key is six bytes, most significant byte first.
+using CandidateSink = bool (*)(const uint8_t key[6], void *context);
+Result enumerateKeys(uint32_t uid, const Sample &sample, int parity, CandidateSink sink,
+                     void *context, Progress progress = nullptr, void *progressContext = nullptr);
 } // namespace mfc_recovery

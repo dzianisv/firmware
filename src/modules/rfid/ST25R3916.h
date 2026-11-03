@@ -72,8 +72,30 @@ public:
     // resetDump=false keeps keys/blocks already collected on this card.
     bool selectMifareClassic(uint32_t timeoutMs = 5000, bool resetDump = true);
 
-    // Experimental key-recovery entry point; not validated on hardware.
+    // Read-only single-key test: reselect, authenticate to one block, halt.
+    bool mfcAuthTest(uint8_t block, const uint8_t key[6], bool useKeyB);
+
+    // Read-only PRNG probe: one authenticated session, then repeated nested
+    // auths. Reports the median step between consecutive nonces.
+    RecoveryResult mfcMeasureDistance(uint8_t knownBlock, const uint8_t knownKey[6], bool knownB,
+                                      uint32_t *distOut);
+
+    // Static-nonce cards repeat one nonce forever, which kills nested and
+    // darkside. The single keystream window still pins the key to ~2^16
+    // candidates; each is tested against the card. Read-only.
+    RecoveryResult recoverKeyStaticNonce(uint8_t knownBlock, const uint8_t knownKey[6], bool knownB,
+                                         uint8_t targetBlock, bool targetB, uint8_t recoveredKey[6],
+                                         mfc_recovery::Progress progress = nullptr,
+                                         void *context = nullptr);
+
+    // Nested key recovery for every sector whose keys are still unknown.
     int recoverAllKeys(mfc_recovery::Progress progress = nullptr, void *context = nullptr);
+
+    // Nested key recovery for one sector (both key types that are still
+    // unknown). Returns the number of keys newly found, or a negative error
+    // code shared with recoverAllKeys.
+    int recoverSectorKeys(uint8_t sector, mfc_recovery::Progress progress = nullptr,
+                          void *context = nullptr);
 
     // Read-only diagnostic: log nonce/parity/PRNG-distance values for a known
     // key (same-block nested auth) and for a target block. No key material is
@@ -156,13 +178,30 @@ private:
         uint8_t *txBuf, uint16_t txBits, uint8_t *rxBuf, uint16_t rxCapBytes, uint16_t *rxBits, uint32_t fwt,
         uint32_t flags
     );
-    bool _mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB);
+    bool _mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB, uint32_t fwtMs = 20);
     bool _mifareReadBlock(uint8_t block, uint8_t data[16]);
     bool _mifareWriteBlock(uint8_t block, const uint8_t data[16]);
     void _mfcHalt();
     bool _mfcNestedAuthCapture(uint8_t block, bool useKeyB, uint32_t *encNtOut, uint8_t par[3]);
-    bool _mfcMeasureNtDistance(uint8_t knownBlock, const uint8_t knownKey[6], bool knownB,
-                               uint32_t *distOut);
+    bool _mfcFastSelect();
+    bool _mfcTryKeyFast(uint8_t block, const uint8_t key[6], bool useKeyB);
+    static bool _mfcStaticSink(const uint8_t key[6], void *context);
+    struct StaticSinkCtx {
+        ST25R3916 *self = nullptr;
+        uint8_t block = 0;
+        bool useB = false;
+        uint8_t key[6] = {};
+        uint32_t tried = 0;
+        uint32_t started = 0;
+        unsigned selectFails = 0;
+        bool found = false;
+        bool aborted = false;
+        mfc_recovery::Progress progress = nullptr;
+        void *progressContext = nullptr;
+    };
+    bool _mfcLastSelectOk = false;
+    RecoveryResult _mfcMeasureNtDistance(uint8_t knownBlock, const uint8_t knownKey[6], bool knownB,
+                                         uint32_t *distOut);
     bool _mfcDarksideSelect(uint32_t timeoutMs = 500);
     bool _mfcDarksideAuthNt(uint8_t block, bool useKeyB, uint32_t *ntOut);
     bool _mfcDarksideProbe(uint8_t block, bool useKeyB, uint32_t nrEnc, uint32_t arEnc,
@@ -177,10 +216,6 @@ private:
     bool _mfcCaptureNonceRaw(uint8_t block, const uint8_t key[6], bool useKeyB, uint32_t *ntOut);
     int _mfcCollectNonces(rfalNfcDevice *dev, uint8_t block, bool useKeyB, int maxSamples);
     bool _mfcRecoverPrngState(uint32_t *prngStateOut);
-    bool _mfcRecoverKeyByNestedAuth(rfalNfcDevice *dev, uint8_t block, bool useKeyB,
-                                    const uint8_t knownKey[6], uint8_t recoveredKey[6]);
-    bool _mfcRecoverSectorKeys(rfalNfcDevice *dev, uint8_t sector, const uint8_t bootstrapKey[6]);
-    int _mfcRecoverAllKeys(rfalNfcDevice *dev);
 
     // helpers
     String _getNtagVariant();

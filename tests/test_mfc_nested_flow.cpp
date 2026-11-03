@@ -8,6 +8,7 @@
 #include "../src/modules/rfid/crypto1.h"
 #include "../src/modules/rfid/mfc_nonce.h"
 #include "../src/modules/rfid/mfc_recovery.h"
+#include "../src/modules/rfid/mfc_nested.h"
 
 namespace {
 
@@ -204,6 +205,60 @@ int run_case(uint32_t expected_dist) {
     return 0;
 }
 
+
+// Exercise the exact device path: mfc_nested::solve() over parity-filtered
+// PRNG-distance candidates, with a PRNG distance that can wobble between
+// captures like a real card.
+int run_solve_case(uint32_t median, int spread, unsigned maxCalls) {
+    SimCard card{0x2b7e, 0xdeadbeef, 0x0123456789abULL, 0xa0a1a2a3a4a5ULL};
+    const int kCaptures = 6;
+
+    mfc_nested::Capture caps[kCaptures];
+    for (int i = 0; i < kCaptures; i++) {
+        const uint32_t d = (uint32_t)((int)median + ((i % 3) - 1) * spread);
+        caps[i].nt1 = card.next_nonce();
+        card.advance(d - 1);
+        const uint32_t nt = card.next_nonce();
+        card.nested_nonce(card.target_key, nt, &caps[i].enc, caps[i].par);
+    }
+
+    uint8_t key[6] = {0};
+    unsigned calls = 0;
+    const auto r = mfc_nested::solve(card.uid, caps, kCaptures, median, 20, key, nullptr, nullptr,
+                                     &calls);
+    if (r != mfc_recovery::Result::Found) {
+        printf("FAIL: solve median=%u spread=%d result %d calls=%u\n", median, spread, (int)r,
+               calls);
+        return 1;
+    }
+    uint64_t recovered = 0;
+    for (int i = 0; i < 6; i++) recovered = (recovered << 8) | key[i];
+    if (recovered != card.target_key) {
+        printf("FAIL: solve median=%u spread=%d recovered %012llX\n", median, spread,
+               (unsigned long long)recovered);
+        return 1;
+    }
+    if (calls > maxCalls) {
+        printf("FAIL: solve median=%u spread=%d used %u solver calls (budget %u)\n", median, spread,
+               calls, maxCalls);
+        return 1;
+    }
+
+    // A window that cannot contain the true distance must not invent a key.
+    uint8_t bad[6] = {0};
+    unsigned badCalls = 0;
+    const auto miss =
+        mfc_nested::solve(card.uid, caps, 2, median + 4000, 0, bad, nullptr, nullptr, &badCalls);
+    if (miss == mfc_recovery::Result::Found) {
+        printf("FAIL: solve accepted a wrong distance window\n");
+        return 1;
+    }
+
+    printf("PASS: solve median=%u spread=%d calls=%u key=%012llX window-reject=%d\n", median,
+           spread, calls, (unsigned long long)recovered, (int)miss);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -211,6 +266,11 @@ int main() {
     for (uint32_t d : distances) {
         if (run_case(d) != 0) return 1;
     }
+    // Constant PRNG advance resolves on the first distance, one solver call.
+    if (run_solve_case(256, 0, 1) != 0) return 1;
+    // Jittered advance: two of six captures share the median distance.
+    if (run_solve_case(256, 2, 4) != 0) return 1;
+    if (run_solve_case(1024, 4, 6) != 0) return 1;
     printf("PASS: all distances\n");
     return 0;
 }
