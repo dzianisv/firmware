@@ -1172,7 +1172,10 @@ bool ST25R3916::_mfcDarksideProbe(uint8_t block, bool useKeyB, uint32_t nrEnc, u
     uint8_t rx[8] = {0};
     uint16_t rxBits = 0;
     auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(20), MFC_FLAGS_ENC);
-    if (!_mfcRxOk(err) || rxBits < 4) {
+    // A real darkside answer is exactly a 4-bit NAK. A framing/parity error can
+    // leave 4 garbage bits in the buffer, and counting those as "answered" made
+    // the preflight believe this card still had a parity oracle.
+    if (!_mfcRxOk(err) || rxBits != 4) {
         ST25R_RECOVERY_LOG("darkside probe nr=%08lX ar=%08lX par=%02X err=%d bits=%u",
                            (unsigned long)nrEnc, (unsigned long)arEnc, parBits, (int)err, rxBits);
         return false;
@@ -1463,7 +1466,14 @@ int ST25R3916::recoverSectorKeys(uint8_t sector, mfc_recovery::Progress progress
                 ds == RecoveryResult::Cancelled || ds == RecoveryResult::NoMemory) {
                 res = ds;
             }
-            if (ds == RecoveryResult::Unsupported) {
+            // Any non-decisive darkside outcome (Unsupported, NotFound, NoTag,
+            // AuthenticationFailed, InternalError, ...) still leaves the
+            // static-nonce route worth trying, so do not enumerate failures.
+            const bool dsDecisive = ds == RecoveryResult::Verified ||
+                                    ds == RecoveryResult::AlreadyKnown ||
+                                    ds == RecoveryResult::Cancelled ||
+                                    ds == RecoveryResult::NoMemory;
+            if (!dsDecisive) {
                 // Neither oracle exists: the card repeats one nonce and never
                 // NAKs. The single keystream window still pins the key to
                 // ~2^16 candidates, each checked with a real authentication.
