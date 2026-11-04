@@ -246,9 +246,14 @@ void ST25R3916::_probeField(const char *where) {
     _logOpControl("after manual field off");
 }
 
-ST25R3916::ST25R3916(CONNECTION_TYPE connection_type) : _connection_type(connection_type) {}
+ST25R3916::ST25R3916(CONNECTION_TYPE connection_type) : _connection_type(connection_type) {
+    // Pin the solver scratch now, before tag reads fragment the heap and make
+    // the 98 KiB contiguous block unavailable.
+    mfc_recovery::reserveSolverScratch();
+}
 
 ST25R3916::~ST25R3916() {
+    mfc_recovery::releaseSolverScratch();
     stopDiscovery();
     _setNfcPower(false);
     delete _nfc;
@@ -526,12 +531,6 @@ ST25R3916::RecoveryResult ST25R3916::recoverKeyStaticNonce(
         par[1],
         par[2]
     );
-
-    if (ESP.getFreeHeap() < 110 * 1024) {
-        _nfc->rfalNfcDeactivate(false);
-        stopDiscovery();
-        return RecoveryResult::NoMemory;
-    }
 
     StaticSinkCtx ctx{};
     ctx.self = this;
@@ -860,6 +859,7 @@ ST25R3916::RecoveryResult ST25R3916::recoverKey(uint8_t knownBlock, const uint8_
         _mfcAuthed = false;
         return measured;
     }
+    _mfcLastDist = dist;
     ST25R_RECOVERY_LOG(
         "recover: dist=%u heap=%u%s", dist, (unsigned)ESP.getFreeHeap(),
         dist == 0 ? " (static nonce)" : ""
@@ -921,14 +921,6 @@ ST25R3916::RecoveryResult ST25R3916::recoverKey(uint8_t knownBlock, const uint8_
         stopDiscovery();
         _mfcAuthed = false;
         return got == 0 ? RecoveryResult::Unsupported : RecoveryResult::NotFound;
-    }
-
-    // The solver prefers internal RAM but can fall back to PSRAM, so only
-    // reject early when neither pool can plausibly hold the 98 KiB scratch.
-    if (ESP.getFreeHeap() < 120 * 1024 && !psramFound()) {
-        _nfc->rfalNfcDeactivate(false);
-        stopDiscovery();
-        return RecoveryResult::NoMemory;
     }
 
     // mfoc-style: build parity-filtered plaintext candidates per capture and
@@ -1406,7 +1398,8 @@ int ST25R3916::recoverAllKeys(mfc_recovery::Progress progress, void *context) {
 
 void ST25R3916::rememberRecoveredKey(const uint8_t key[6]) { _mfcRememberKey(key); }
 
-int ST25R3916::recoverSectorKeys(uint8_t sector, mfc_recovery::Progress progress, void *context) {
+int ST25R3916::recoverSectorKeys(uint8_t sector, mfc_recovery::Progress progress, void *context,
+                                  bool stopAfterFirst) {
     if (!_nfc) return -1;
     if (mfcDump.sectors == 0 || sector >= mfcDump.sectors) return -1;
 
@@ -1455,39 +1448,65 @@ int ST25R3916::recoverSectorKeys(uint8_t sector, mfc_recovery::Progress progress
         if (res != RecoveryResult::Verified && res != RecoveryResult::AlreadyKnown &&
             res != RecoveryResult::Cancelled && res != RecoveryResult::NoMemory) {
             // Nested authentication needs two different plaintext nonces. A
-            // card with a static PRNG never supplies them, and the darkside
-            // attack needs exactly that property, so fall back to it.
-            ST25R_RECOVERY_LOG("recoverSector: sector %u key %c trying darkside", sector,
-                               useB ? 'B' : 'A');
-            auto ds = recoverKeyDarkside(trailer, useB != 0, key, progress, context);
-            ST25R_RECOVERY_LOG("recoverSector: sector %u key %c darkside -> %s", sector,
-                               useB ? 'B' : 'A', recoveryStatus(ds));
-            if (ds == RecoveryResult::Verified || ds == RecoveryResult::AlreadyKnown ||
-                ds == RecoveryResult::Cancelled || ds == RecoveryResult::NoMemory) {
-                res = ds;
-            }
-            // Any non-decisive darkside outcome (Unsupported, NotFound, NoTag,
-            // AuthenticationFailed, InternalError, ...) still leaves the
-            // static-nonce route worth trying, so do not enumerate failures.
-            const bool dsDecisive = ds == RecoveryResult::Verified ||
-                                    ds == RecoveryResult::AlreadyKnown ||
-                                    ds == RecoveryResult::Cancelled ||
-                                    ds == RecoveryResult::NoMemory;
-            if (!dsDecisive) {
-                // Neither oracle exists: the card repeats one nonce and never
-                // NAKs. The single keystream window still pins the key to
-                // ~2^16 candidates, each checked with a real authentication.
-                ST25R_RECOVERY_LOG("recoverSector: sector %u key %c trying static-nonce", sector,
-                                   useB ? 'B' : 'A');
+            // card with a static PRNG (distance 0) never supplies them, so try
+            // the single-keystream enumeration before the parity oracle: darkside
+            // runs many short transceives that fragment the heap and can later
+            // prevent the 98 KiB solver scratch from allocating.
+            bool staticTried = false;
+            if (res == RecoveryResult::NotFound && _mfcLastDist == 0) {
+                ST25R_RECOVERY_LOG("recoverSector: sector %u key %c trying static-nonce (dist=0)",
+                                   sector, useB ? 'B' : 'A');
                 auto sn = recoverKeyStaticNonce(
                     knownBlock, knownKey, bootB, trailer, useB != 0, key, progress, context
                 );
                 ST25R_RECOVERY_LOG("recoverSector: sector %u key %c static -> %s", sector,
                                    useB ? 'B' : 'A', recoveryStatus(sn));
-                res = sn;
+                staticTried = true;
+                if (sn == RecoveryResult::Verified || sn == RecoveryResult::AlreadyKnown ||
+                    sn == RecoveryResult::Cancelled || sn == RecoveryResult::NoMemory) {
+                    res = sn;
+                }
+            }
+            if (res != RecoveryResult::Verified && res != RecoveryResult::AlreadyKnown &&
+                res != RecoveryResult::Cancelled && res != RecoveryResult::NoMemory) {
+                ST25R_RECOVERY_LOG("recoverSector: sector %u key %c trying darkside", sector,
+                                   useB ? 'B' : 'A');
+                auto ds = recoverKeyDarkside(trailer, useB != 0, key, progress, context);
+                ST25R_RECOVERY_LOG("recoverSector: sector %u key %c darkside -> %s", sector,
+                                   useB ? 'B' : 'A', recoveryStatus(ds));
+                if (ds == RecoveryResult::Verified || ds == RecoveryResult::AlreadyKnown ||
+                    ds == RecoveryResult::Cancelled || ds == RecoveryResult::NoMemory) {
+                    res = ds;
+                }
+                // Any non-decisive darkside outcome (Unsupported, NotFound, NoTag,
+                // AuthenticationFailed, InternalError, ...) still leaves the
+                // static-nonce route worth trying, so do not enumerate failures.
+                const bool dsDecisive = ds == RecoveryResult::Verified ||
+                                        ds == RecoveryResult::AlreadyKnown ||
+                                        ds == RecoveryResult::Cancelled ||
+                                        ds == RecoveryResult::NoMemory;
+                if (!dsDecisive && !staticTried) {
+                    // Neither oracle exists: the card repeats one nonce and never
+                    // NAKs. The single keystream window still pins the key to
+                    // ~2^16 candidates, each checked with a real authentication.
+                    ST25R_RECOVERY_LOG("recoverSector: sector %u key %c trying static-nonce",
+                                       sector, useB ? 'B' : 'A');
+                    auto sn = recoverKeyStaticNonce(
+                        knownBlock, knownKey, bootB, trailer, useB != 0, key, progress, context
+                    );
+                    ST25R_RECOVERY_LOG("recoverSector: sector %u key %c static -> %s", sector,
+                                       useB ? 'B' : 'A', recoveryStatus(sn));
+                    res = sn;
+                }
             }
         }
-        if (res == RecoveryResult::Verified || res == RecoveryResult::AlreadyKnown) found++;
+        if (res == RecoveryResult::Verified || res == RecoveryResult::AlreadyKnown) {
+            found++;
+            if (stopAfterFirst && found > 0) {
+                ST25R_RECOVERY_LOG("recoverSector: sector %u stop after first key", sector);
+                break;
+            }
+        }
         if (res == RecoveryResult::Cancelled) return -2;
         if (res == RecoveryResult::NoMemory) return -3;
         if (res == RecoveryResult::NoTag || res == RecoveryResult::Unsupported ||

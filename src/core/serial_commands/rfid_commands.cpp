@@ -449,7 +449,8 @@ uint32_t rfidRecoverCallback(cmd *c) {
     const String sectorValue = cmd.getArgument("sector").getValue();
     const bool oneSector = sectorValue.length() > 0 && sectorValue.toInt() >= 0;
     const int recovered = oneSector
-                              ? st25r->recoverSectorKeys((uint8_t)sectorValue.toInt(), progress, nullptr)
+                              ? st25r->recoverSectorKeys((uint8_t)sectorValue.toInt(), progress, nullptr,
+                                                         /*stopAfterFirst=*/true)
                               : st25r->recoverAllKeys(progress, nullptr);
 
     if (recovered == -2) {
