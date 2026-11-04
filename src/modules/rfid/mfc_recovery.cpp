@@ -314,6 +314,24 @@ static void *alloc_scratch(size_t size) { return std::malloc(size); }
 static void free_scratch(void *p) { std::free(p); }
 #endif
 
+// Persistent scratch reserved early (e.g. in the ST25R3916 constructor) so
+// the solver is not blocked by heap fragmentation caused by tag reads.
+static Scratch *g_reservedScratch = nullptr;
+
+bool reserveSolverScratch() {
+    if (!g_reservedScratch) {
+        g_reservedScratch = static_cast<Scratch *>(alloc_scratch(sizeof(Scratch)));
+    }
+    return g_reservedScratch != nullptr;
+}
+
+void releaseSolverScratch() {
+    if (g_reservedScratch) {
+        free_scratch(g_reservedScratch);
+        g_reservedScratch = nullptr;
+    }
+}
+
 Result recover(uint32_t uid, const Sample &first, const Sample &second, uint8_t key[6],
                Progress progress, void *context) {
     if (!key || first.nt == second.nt) return Result::InvalidInput;
@@ -322,8 +340,14 @@ Result recover(uint32_t uid, const Sample &first, const Sample &second, uint8_t 
 #ifdef MFC_RECOVERY_TESTING
     // Test-only allocator fault injection / accounting; search is unchanged.
     Scratch *scratch = static_cast<Scratch *>(test_allocate(sizeof(Scratch)));
+    const bool ownsScratch = true;
 #else
-    Scratch *scratch = static_cast<Scratch *>(alloc_scratch(sizeof(Scratch)));
+    Scratch *scratch = g_reservedScratch;
+    bool ownsScratch = false;
+    if (!scratch) {
+        scratch = static_cast<Scratch *>(alloc_scratch(sizeof(Scratch)));
+        ownsScratch = true;
+    }
 #endif
     if (!scratch) return Result::NoMemory;
     uint8_t candidate[6];
@@ -332,7 +356,7 @@ Result recover(uint32_t uid, const Sample &first, const Sample &second, uint8_t 
 #ifdef MFC_RECOVERY_TESTING
     test_release(scratch);
 #else
-    free_scratch(scratch);
+    if (ownsScratch) free_scratch(scratch);
 #endif
     if (result == Result::Found) std::memcpy(key, candidate, sizeof(candidate));
     return result;
@@ -343,12 +367,17 @@ Result enumerateKeys(uint32_t uid, const Sample &sample, int parity, CandidateSi
     if (!sink) return Result::InvalidInput;
     Control control{progress, progressContext};
     if (!control.poll()) return Result::Cancelled;
-    Scratch *scratch = static_cast<Scratch *>(alloc_scratch(sizeof(Scratch)));
+    Scratch *scratch = g_reservedScratch;
+    bool ownsScratch = false;
+    if (!scratch) {
+        scratch = static_cast<Scratch *>(alloc_scratch(sizeof(Scratch)));
+        ownsScratch = true;
+    }
     if (!scratch) return Result::NoMemory;
     uint8_t candidate[6];
     Target target{nullptr, &sample, parity, sink, context};
     const Result result = search(*scratch, uid, target, candidate, control);
-    free_scratch(scratch);
+    if (ownsScratch) free_scratch(scratch);
     return result;
 }
 } // namespace mfc_recovery

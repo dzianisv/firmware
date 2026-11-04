@@ -93,9 +93,12 @@ public:
 
     // Nested key recovery for one sector (both key types that are still
     // unknown). Returns the number of keys newly found, or a negative error
-    // code shared with recoverAllKeys.
+    // code shared with recoverAllKeys. When stopAfterFirst is true the sector
+    // loop exits as soon as one key is recovered; this keeps the one-sector
+    // `rfid recover <sector>` command from spending another crypto pass on Key B
+    // when Key A is enough to read the sector.
     int recoverSectorKeys(uint8_t sector, mfc_recovery::Progress progress = nullptr,
-                          void *context = nullptr);
+                          void *context = nullptr, bool stopAfterFirst = false);
 
     // Register a key recovered elsewhere so a later `rfid read` can open the
     // sector. No effect on the card.
@@ -221,6 +224,7 @@ private:
     bool _mfcDarksideProbe(uint8_t block, bool useKeyB, uint32_t nrEnc, uint32_t arEnc,
                            uint8_t parBits, uint8_t *nackOut);
     uint32_t _mfcLastNt = 0;
+    uint32_t _mfcLastDist = 0;
     int _writeMifareClassic(rfalNfcDevice *dev);       // authenticated write of loaded dump
     int _writeMifareClassicMagic(rfalNfcDevice *dev);  // clone to Magic Gen1
     void _mfcRebuildStrAllPages();
