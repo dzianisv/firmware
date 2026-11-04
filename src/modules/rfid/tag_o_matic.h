@@ -119,7 +119,7 @@ private:
     /////////////////////////////////////////////////////////////////////////////////////
     void diag_card();                              // main diagnostic loop
     void diag_displaySector(uint8_t sector, uint8_t block, bool authOk, bool readOk, const char *error);
-    void diag_recoverKeys();                       // run darkside key recovery on all sectors
+    void diag_recoverKeys();                       // nested key recovery on all sectors
     void diag_printKeyTable();                     // display recovered keys
 
     /////////////////////////////////////////////////////////////////////////////////////

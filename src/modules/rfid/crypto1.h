@@ -33,6 +33,21 @@ uint32_t crypto1_word(Crypto1State *state, uint32_t in, int is_encrypted);
 /** Current filter output (next keystream bit) — used to compute encrypted parity. */
 uint8_t crypto1_filter_bit(const Crypto1State *state);
 
+/** Crypto1 filter for a raw 20-bit LFSR word (used by the darkside solver). */
+uint8_t crypto1_filter_u32(uint32_t x);
+
+/** Parity of a raw 32-bit word (used by the darkside solver). */
+uint8_t crypto1_parity32(uint32_t x);
+
+/** Roll the cipher backwards by one bit. Returns the filter output. */
+uint8_t crypto1_rollback_bit(Crypto1State *state, uint32_t in, int fb);
+
+/** Roll the cipher backwards by one 32-bit word (big-endian bit order). */
+uint32_t crypto1_rollback_word(Crypto1State *state, uint32_t in, int fb);
+
+/** Extract the 48-bit key from a rolled-back cipher state. */
+void crypto1_get_lfsr(const Crypto1State *state, uint64_t *key);
+
 /** MIFARE LCG nonce successor: advances PRNG state x by n cycles. */
 uint32_t prng_successor(uint32_t x, uint32_t n);
 
