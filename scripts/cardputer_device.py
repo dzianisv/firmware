@@ -252,6 +252,13 @@ def test(args, output):
                         ok = bool(re.search(r"Darkside result: (Verified|AlreadyKnown)", out))
                     elif spec.strip().startswith("rfid mfcstatic"):
                         ok = bool(re.search(r"Static result: Verified", out))
+                    elif spec.strip().startswith("rfid read"):
+                        # A partial read is a success as long as blocks came back;
+                        # [AUTH FAIL] on an unknown sector is not a read failure.
+                        pages_match = re.search(r"^Pages:\s*(\d+)", out, re.M)
+                        ok = bool(pages_match) and int(pages_match.group(1)) > 0
+                    elif spec.strip().startswith("rfid recover"):
+                        ok = bool(re.search(r"New keys recovered:\s*\d+", out))
                     first = next((l.strip() for l in reversed(out.splitlines()) if l.strip()), "")
                     record(f"serial: {spec}", ok, first[:200] or "no output")
                 if args.recover and has_tag:
