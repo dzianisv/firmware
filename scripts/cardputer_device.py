@@ -250,6 +250,8 @@ def test(args, output):
                         ok = bool(re.search(r": PASS", out))
                     elif spec.strip().startswith("rfid mfcdarkside"):
                         ok = bool(re.search(r"Darkside result: (Verified|AlreadyKnown)", out))
+                    elif spec.strip().startswith("rfid mfcstatic"):
+                        ok = bool(re.search(r"Static result: Verified", out))
                     first = next((l.strip() for l in reversed(out.splitlines()) if l.strip()), "")
                     record(f"serial: {spec}", ok, first[:200] or "no output")
                 if args.recover and has_tag:
