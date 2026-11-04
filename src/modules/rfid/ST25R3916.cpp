@@ -288,6 +288,10 @@ bool ST25R3916::_initSPI() {
 
 bool ST25R3916::_initI2C() {
     TwoWire *Wire = acquireI2CBus();
+    // RFAL polls the chip's interrupt/status registers over I2C; without an IRQ
+    // line that register traffic dominates every frame. 400 kHz is the
+    // ST25R3916 fast-mode limit and roughly quarters the per-frame cost.
+    if (Wire) Wire->setClock(400000);
     _hw = new RfalRfST25R3916Class(Wire, GPIO_NUM_NC);
     return _hw != nullptr;
 }
@@ -537,6 +541,15 @@ ST25R3916::RecoveryResult ST25R3916::recoverKeyStaticNonce(
     ctx.progressContext = context;
     ctx.started = millis();
 
+    // One-time chip setup: per-candidate init costs more than the auth itself.
+    if (!_mfcPrepareFast()) {
+        _nfc->rfalNfcDeactivate(false);
+        stopDiscovery();
+        _mfcFastReady = false;
+        return RecoveryResult::InternalError;
+    }
+    ST25R_RECOVERY_LOG("static: fast-select ready, starting enumeration");
+
     const mfc_recovery::Sample sample{nt, enc};
     const mfc_recovery::Result r =
         mfc_recovery::enumerateKeys(_mfcUid32(), sample, -1, _mfcStaticSink, &ctx);
@@ -551,7 +564,7 @@ ST25R3916::RecoveryResult ST25R3916::recoverKeyStaticNonce(
     _nfc->rfalNfcDeactivate(false);
     stopDiscovery();
     _mfcAuthed = false;
-
+    _mfcFastReady = false;
     if (ctx.found) {
         memcpy(recoveredKey, ctx.key, 6);
         return RecoveryResult::Verified;
@@ -569,15 +582,30 @@ bool ST25R3916::_mfcStaticSink(const uint8_t key[6], void *context) {
     ctx->tried++;
     if (ctx->progress && (ctx->tried & 0xFFu) == 0) {
         const unsigned done = (unsigned)((ctx->tried * 256u) / 65536u);
+        ST25R_RECOVERY_LOG(
+            "static: avg select=%luus auth=%luus tries=%lu",
+            (unsigned long)(ctx->selectUs / ctx->tried),
+            (unsigned long)(ctx->authUs / ctx->tried),
+            (unsigned long)ctx->tried
+        );
         if (!ctx->progress(done, 256, ctx->progressContext)) {
             ctx->aborted = true;
             return true;
         }
     }
-    if (ctx->self->_mfcTryKeyFast(ctx->block, key, ctx->useB)) {
-        memcpy(ctx->key, key, 6);
-        ctx->found = true;
-        return true;
+    const uint32_t tSel = micros();
+    const bool selOk = ctx->self->_mfcFastSelect();
+    ctx->selectUs += micros() - tSel;
+    ctx->self->_mfcLastSelectOk = selOk;
+    if (selOk) {
+        const uint32_t tAuth = micros();
+        if (ctx->self->_mifareAuth(ctx->block, key, ctx->useB, 2)) {
+            ctx->authUs += micros() - tAuth;
+            memcpy(ctx->key, key, 6);
+            ctx->found = true;
+            return true;
+        }
+        ctx->authUs += micros() - tAuth;
     }
     if (!ctx->self->_mfcLastSelectOk) {
         if (++ctx->selectFails > 64) {
@@ -591,7 +619,7 @@ bool ST25R3916::_mfcStaticSink(const uint8_t key[6], void *context) {
     return false;
 }
 
-bool ST25R3916::_mfcFastSelect() {
+bool ST25R3916::_mfcPrepareFast() {
     if (!_nfc || !_hw) return false;
     if (_discoveryStarted) {
         _nfc->rfalNfcDeactivate(false);
@@ -599,19 +627,64 @@ bool ST25R3916::_mfcFastSelect() {
     }
     _hw->st25r3916OscOn();
     if (_nfc->rfalNfcaPollerInitialize() != ST_ERR_NONE) return false;
-    rfalNfcaSensRes sens;
-    if (_nfc->rfalNfcaPollerCheckPresence(RFAL_14443A_SHORTFRAME_CMD_WUPA, &sens) != ST_ERR_NONE)
-        return false;
-    rfalNfcaSelRes sel;
-    uint8_t nfcid[RFAL_NFCA_CASCADE_3_UID_LEN] = {0};
-    uint8_t nfcidLen = 0;
-    bool collPending = false;
-    if (_nfc->rfalNfcaPollerSingleCollisionResolution(1, &collPending, &sel, nfcid, &nfcidLen) !=
-        ST_ERR_NONE)
-        return false;
-    if (nfcidLen != uid.size || memcmp(nfcid, uid.uidByte, nfcidLen) != 0) return false;
-    _mfcAuthed = false;
+    _mfcFastReady = true;
     return true;
+}
+
+// Direct ISO14443A SELECT for a 4-byte UID: one frame instead of the full
+// anticollision loop. Used only when the UID length is 4.
+bool ST25R3916::_mfcDirectSelect() {
+    if (uid.size != 4) return false;
+    uint8_t tx[9];
+    tx[0] = 0x93; // SEL cascade level 1
+    tx[1] = 0x70; // NVB: 7 whole bytes follow
+    uint8_t bcc = 0;
+    for (int i = 0; i < 4; i++) {
+        tx[2 + i] = uid.uidByte[i];
+        bcc ^= uid.uidByte[i];
+    }
+    tx[6] = bcc;
+    const uint16_t crc = _hw->rfalCrcCalculateCcitt(0x6363, tx, 7);
+    tx[7] = (uint8_t)(crc & 0xFF);
+    tx[8] = (uint8_t)(crc >> 8);
+    uint8_t rx[4] = {0};
+    uint16_t rxLen = 0;
+    const auto err = _hw->rfalTransceiveBlockingTxRx(
+        tx,
+        sizeof(tx),
+        rx,
+        sizeof(rx),
+        &rxLen,
+        RFAL_TXRX_FLAGS_CRC_TX_MANUAL | RFAL_TXRX_FLAGS_CRC_RX_KEEP,
+        rfalConvMsTo1fc(5)
+    );
+    if (err != ST_ERR_NONE || rxLen < 1) return false;
+    return isMifareClassicSak(rx[0]);
+}
+
+bool ST25R3916::_mfcFastSelect() {
+    if (!_nfc || !_hw) return false;
+    if (!_mfcFastReady && !_mfcPrepareFast()) {
+        _mfcFastSelectStep = 1;
+        return false;
+    }
+    for (int attempt = 0; attempt < 2; attempt++) {
+        rfalNfcaSensRes sens;
+        if (_nfc->rfalNfcaPollerCheckPresence(RFAL_14443A_SHORTFRAME_CMD_WUPA, &sens) == ST_ERR_NONE) {
+            if (_mfcDirectSelect()) {
+                _mfcFastSelectStep = 0;
+                _mfcAuthed = false;
+                return true;
+            }
+            _mfcFastSelectStep = 3;
+            continue;
+        }
+        _mfcFastSelectStep = 2;
+        // A card left ACTIVE ignores WUPA; halt it and retry once.
+        _mfcHalt();
+        delay(1);
+    }
+    return false;
 }
 
 bool ST25R3916::_mfcTryKeyFast(uint8_t block, const uint8_t key[6], bool useKeyB) {
@@ -1665,6 +1738,8 @@ int ST25R3916::read(int cardBaudRate) {
 }
 
 bool ST25R3916::_pollForTag(rfalNfcDevice **dev, uint32_t timeoutMs) {
+    // Any full rediscovery reconfigures the chip, so the fast-select setup is stale.
+    _mfcFastReady = false;
     if (_discoveryStarted) {
         _nfc->rfalNfcDeactivate(false);
         _discoveryStarted = false;
@@ -3319,7 +3394,7 @@ static uint8_t _mfcUnpackParity(const uint8_t *in, uint16_t nbits, uint8_t *outP
     if (err != ST_ERR_NONE) return err;
 
     uint32_t t0 = millis();
-    while ((millis() - t0) < 60) {
+    while ((millis() - t0) < 25) {
         _hw->rfalWorker();
         err = _hw->rfalGetTransceiveStatus();
         if (err != ST_ERR_BUSY) break;
@@ -3553,9 +3628,36 @@ void ST25R3916::_mfcHalt() {
     _mfcAuthed = false;
 }
 
+bool ST25R3916::_mfcReacquire(uint32_t timeoutMs, int attempts) {
+    if (!_nfc || !_hw) return false;
+    if (attempts < 1) attempts = 1;
+    for (int i = 0; i < attempts; i++) {
+        _mfcHalt();
+        _nfc->rfalNfcDeactivate(false);
+        _discoveryStarted = false;
+        delay(10);
+        rfalNfcDevice *dev = nullptr;
+        if (!_pollForTag(&dev, timeoutMs) || !dev) continue;
+        if (dev->type != RFAL_NFC_LISTEN_TYPE_NFCA) {
+            _nfc->rfalNfcDeactivate(false);
+            _discoveryStarted = false;
+            continue;
+        }
+        if (uid.size == 0 || dev->nfcidLen != uid.size ||
+            memcmp(dev->nfcid, uid.uidByte, uid.size) != 0) {
+            _nfc->rfalNfcDeactivate(false);
+            _discoveryStarted = false;
+            continue;
+        }
+        _parseDevice(dev);
+        _mfcAuthed = false;
+        return true;
+    }
+    return false;
+}
+
 // ========================================================================================
 // MIFARE Classic Key Recovery — Darkside / Nested Attack
-// ========================================================================================
 //
 // Recovers unknown sector keys from nonce leakage during failed authentication.
 //
@@ -3781,6 +3883,9 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
 
     const int nKeys = (int)(sizeof(keys) / sizeof(keys[0]));
     int blocksOk = 0;
+    // One retry per sector: a single missed anticollision must not cost the
+    // whole sector, but a card that is really gone should end the read.
+    bool retriedSector[40] = {false};
 
     for (uint8_t s = 0; s < mfcDump.sectors; s++) {
         uint8_t firstBlock = _mfcSectorFirstBlock(s);
@@ -3804,18 +3909,12 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
                 _mfcAuthed = false;
                 // This clone stops answering a bare AUTH after a failed
                 // authentication, so every miss needs a fresh anticollision.
-                _mfcHalt();
-                _nfc->rfalNfcDeactivate(false);
-                delay(5);
-                rfalNfcDevice *d2 = nullptr;
-                if (!_pollForTag(&d2, 500)) {
+                if (!_mfcReacquire(1500, 2)) {
                     // Do not abort the whole read: reselect once and move on
                     // so one exhausted sector cannot hide the rest.
                     cardLost = true;
                     break;
                 }
-                _parseDevice(d2);
-                _mfcAuthed = false;
             }
         }
 
@@ -3829,16 +3928,10 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
                     break;
                 }
                 _mfcAuthed = false;
-                _mfcHalt();
-                _nfc->rfalNfcDeactivate(false);
-                delay(5);
-                rfalNfcDevice *d2 = nullptr;
-                if (!_pollForTag(&d2, 500)) {
+                if (!_mfcReacquire(1500, 2)) {
                     cardLost = true;
                     break;
                 }
-                _parseDevice(d2);
-                _mfcAuthed = false;
             }
         }
 
@@ -3856,26 +3949,28 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
                         break;
                     }
                     _mfcAuthed = false;
-                    _mfcHalt();
-                    _nfc->rfalNfcDeactivate(false);
-                    delay(5);
-                    rfalNfcDevice *d2 = nullptr;
-                    if (!_pollForTag(&d2, 500)) {
+                    if (!_mfcReacquire(1500, 2)) {
                         cardLost = true;
                         break;
                     }
-                    _parseDevice(d2);
-                    _mfcAuthed = false;
                 }
             }
         }
 
         if (cardLost) {
+            if (retriedSector[s]) {
+                ST25R_LOG("mfc read: card lost at sector %u", s);
+                break;
+            }
+            retriedSector[s] = true;
             if (!mfcReselect(3000)) {
                 ST25R_LOG("mfc read: card lost at sector %u", s);
                 break;
             }
-            ST25R_LOG("mfc read: reselected after failed scan of sector %u", s);
+            ST25R_LOG("mfc read: retrying sector %u after reselect", s);
+            // Re-run the same sector from a clean session instead of skipping
+            // it: one missed anticollision used to hide a readable sector.
+            s--;
             continue;
         }
 
@@ -3887,12 +3982,8 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
             ST25R_LOG("mfc read: sector %u has no dictionary key, skipped", s);
             _mfcHalt();
             _nfc->rfalNfcDeactivate(false);
-            delay(5);
-            rfalNfcDevice *d2 = nullptr;
             if (s + 1 < mfcDump.sectors) {
-                if (!_pollForTag(&d2, 500)) break;
-                _parseDevice(d2);
-                _mfcAuthed = false;
+                if (!_mfcReacquire(1500, 2)) break;
             }
             continue;
         }
@@ -3900,22 +3991,16 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
         if (!mfcReselect(5000)) {
             _mfcHalt();
             _mfcAuthed = false;
-            rfalNfcDevice *d2 = nullptr;
             if (s + 1 < mfcDump.sectors) {
-                if (!_pollForTag(&d2, 500)) break;
-                _parseDevice(d2);
-                _mfcAuthed = false;
+                if (!_mfcReacquire(1500, 2)) break;
             }
             continue;
         }
         if (!_mifareAuth(trailer, usedKeyBytes, usedKeyB)) {
             _mfcHalt();
             _mfcAuthed = false;
-            rfalNfcDevice *d2 = nullptr;
             if (s + 1 < mfcDump.sectors) {
-                if (!_pollForTag(&d2, 500)) break;
-                _parseDevice(d2);
-                _mfcAuthed = false;
+                if (!_mfcReacquire(1500, 2)) break;
             }
             continue;
         }
@@ -3943,12 +4028,8 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
         // Re-select before moving to the next sector (fresh first-auth is more robust).
         _mfcHalt();
         _nfc->rfalNfcDeactivate(false);
-        delay(5);
-        rfalNfcDevice *d2 = nullptr;
         if (s + 1 < mfcDump.sectors) {
-            if (!_pollForTag(&d2, 500)) break;
-            _parseDevice(d2);
-            _mfcAuthed = false;
+            if (!_mfcReacquire(1500, 2)) break;
         }
     }
 

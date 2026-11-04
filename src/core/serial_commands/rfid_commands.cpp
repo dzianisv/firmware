@@ -618,11 +618,18 @@ uint32_t rfidMfcStaticCallback(cmd *c) {
         return false;
     }
     uint8_t recovered[6] = {0};
-    auto progress = [](unsigned done, unsigned total, void *) {
+    const uint32_t startedMs = millis();
+    auto progress = [](unsigned done, unsigned total, void *ctx) {
         static unsigned last = 0;
         if (done != last) {
             last = done;
-            serialDevice->println("Trying keys: " + String(done) + "/" + String(total));
+            const uint32_t elapsed = millis() - *(const uint32_t *)ctx;
+            const unsigned tried = (unsigned)((uint64_t)done * 65536u / 256u);
+            serialDevice->println(
+                "Trying keys: " + String(done) + "/" + String(total) + " tried=" + String(tried) +
+                " ms=" + String(elapsed) + " rate=" +
+                String(elapsed ? (unsigned)((uint64_t)tried * 1000u / elapsed) : 0u) + "/s"
+            );
         }
         if (serialDevice->available() && serialDevice->read() == 'q') return false;
         return true;
@@ -635,7 +642,7 @@ uint32_t rfidMfcStaticCallback(cmd *c) {
         targetType.equalsIgnoreCase("B"),
         recovered,
         progress,
-        nullptr
+        (void *)&startedMs
     );
     serialDevice->println(String("Static result: ") + ST25R3916::recoveryStatus(res));
     if (res == ST25R3916::RecoveryResult::Verified) {

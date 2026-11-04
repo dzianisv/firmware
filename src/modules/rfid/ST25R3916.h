@@ -184,7 +184,15 @@ private:
     void _mfcHalt();
     bool _mfcNestedAuthCapture(uint8_t block, bool useKeyB, uint32_t *encNtOut, uint8_t par[3]);
     bool _mfcFastSelect();
+    bool _mfcPrepareFast();
+    bool _mfcDirectSelect();
+    bool _mfcFastReady = false;
     bool _mfcTryKeyFast(uint8_t block, const uint8_t key[6], bool useKeyB);
+    // 0 = ok, 1 = poller init, 2 = WUPA, 3 = SDD/SELECT, 4 = UID mismatch, 5 = not MFC.
+    uint8_t _mfcFastSelectStep = 0;
+    // Halt + deactivate + rediscover with retries. Returns false only when the
+    // card really stops answering.
+    bool _mfcReacquire(uint32_t timeoutMs, int attempts);
     static bool _mfcStaticSink(const uint8_t key[6], void *context);
     struct StaticSinkCtx {
         ST25R3916 *self = nullptr;
@@ -194,6 +202,8 @@ private:
         uint32_t tried = 0;
         uint32_t started = 0;
         unsigned selectFails = 0;
+        uint32_t selectUs = 0;
+        uint32_t authUs = 0;
         bool found = false;
         bool aborted = false;
         mfc_recovery::Progress progress = nullptr;
