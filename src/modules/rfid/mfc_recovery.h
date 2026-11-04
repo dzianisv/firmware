@@ -19,13 +19,6 @@ struct Sample {
 enum class Result { Found, NotFound, Cancelled, NoMemory, InvalidInput, Overflow };
 using Progress = bool (*)(unsigned completed, unsigned total, void *context);
 
-// Pin the ~98 KiB solver scratch now so that later heap fragmentation (e.g.
-// from reading accessible blocks before recovery) cannot prevent the solver
-// from running. The scratch is shared by the nested and static-nonce paths
-// and is freed by releaseSolverScratch().
-bool reserveSolverScratch();
-void releaseSolverScratch();
-
 // Recover from independent authentications under the same unknown key and UID.
 // key is six bytes, most significant byte first; unchanged unless Found.
 // Null key or equal plaintext nonces => InvalidInput. All uint32_t values are valid.

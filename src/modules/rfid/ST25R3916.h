@@ -183,7 +183,7 @@ private:
     uint8_t _mfcBlockToSector(uint16_t block) const;
     ::ReturnCode _mifareTransceiveRaw(
         uint8_t *txBuf, uint16_t txBits, uint8_t *rxBuf, uint16_t rxCapBytes, uint16_t *rxBits, uint32_t fwt,
-        uint32_t flags
+        uint32_t flags, const char *tag = "xcv"
     );
     bool _mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB, uint32_t fwtMs = 20);
     bool _mifareReadBlock(uint8_t block, uint8_t data[16]);
