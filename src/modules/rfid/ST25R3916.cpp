@@ -567,6 +567,8 @@ ST25R3916::RecoveryResult ST25R3916::recoverKeyStaticNonce(
     _mfcFastReady = false;
     if (ctx.found) {
         memcpy(recoveredKey, ctx.key, 6);
+        // Let a `rfid read` in the same boot use the key it just recovered.
+        _mfcRememberKey(ctx.key);
         return RecoveryResult::Verified;
     }
     if (ctx.aborted) return RecoveryResult::Unsupported;
@@ -1398,6 +1400,8 @@ int ST25R3916::recoverAllKeys(mfc_recovery::Progress progress, void *context) {
     ST25R_RECOVERY_LOG("recoverAll: done, new keys=%d", found);
     return found;
 }
+
+void ST25R3916::rememberRecoveredKey(const uint8_t key[6]) { _mfcRememberKey(key); }
 
 int ST25R3916::recoverSectorKeys(uint8_t sector, mfc_recovery::Progress progress, void *context) {
     if (!_nfc) return -1;

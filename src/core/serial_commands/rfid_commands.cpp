@@ -654,6 +654,31 @@ uint32_t rfidMfcStaticCallback(cmd *c) {
     return res == ST25R3916::RecoveryResult::Verified;
 }
 
+// rfid mfcaddkey <12-hex-key>
+// Register a key recovered elsewhere so a later `rfid read` can open the
+// sector it belongs to. Touches no card.
+uint32_t rfidMfcAddKeyCallback(cmd *c) {
+    Command cmd(c);
+    if (cmd.countArgs() < 1) {
+        serialDevice->println("Usage: rfid mfcaddkey <12-hex-key>");
+        return false;
+    }
+    String hex = cmd.getArgument(0).getValue();
+    hex.trim();
+    hex.replace(" ", "");
+    if (hex.length() != 12) {
+        serialDevice->println("ERROR: a 12-hex-character key is required");
+        return false;
+    }
+    uint8_t key[6];
+    for (int i = 0; i < 6; i++) {
+        key[i] = (uint8_t)strtoul(hex.substring(i * 2, i * 2 + 2).c_str(), nullptr, 16);
+    }
+    ST25R3916::rememberRecoveredKey(key);
+    serialDevice->println("Key registered for the next read");
+    return true;
+}
+
 // rfid mfcdarkside <block=4> [A|B]
 // Read-only darkside key recovery for a static/weak nonce card. Prints no key.
 uint32_t rfidMfcDarksideCallback(cmd *c) {
@@ -774,6 +799,9 @@ void createRfidCommands(SimpleCLI *cli) {
     mfcKeyCmd.addPosArg("block", "7");
     mfcKeyCmd.addPosArg("keyType", "A");
     mfcKeyCmd.addPosArg("key", "");
+
+    Command mfcAddKeyCmd = cmd.addCommand("mfcaddkey", rfidMfcAddKeyCallback);
+    mfcAddKeyCmd.addPosArg("key", "");
 
     Command mfcDarksideCmd = cmd.addCommand("mfcdarkside", rfidMfcDarksideCallback);
     mfcDarksideCmd.addPosArg("block", "4");

@@ -97,6 +97,10 @@ public:
     int recoverSectorKeys(uint8_t sector, mfc_recovery::Progress progress = nullptr,
                           void *context = nullptr);
 
+    // Register a key recovered elsewhere so a later `rfid read` can open the
+    // sector. No effect on the card.
+    static void rememberRecoveredKey(const uint8_t key[6]);
+
     // Read-only diagnostic: log nonce/parity/PRNG-distance values for a known
     // key (same-block nested auth) and for a target block. No key material is
     // printed. Returns the number of successful known-key captures.
