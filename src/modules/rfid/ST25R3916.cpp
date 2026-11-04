@@ -4,6 +4,7 @@
 #include "mfc_nonce.h"
 #include "mfc_darkside.h"
 #include "mfc_recovery.h"
+#include "mfc_flipper.h"
 #include "mfc_nested.h"
 
 // ST25R3916 via RFAL fork (lewisxhe/ST25R3916-fork + NFC-RFAL-fork).
@@ -246,14 +247,9 @@ void ST25R3916::_probeField(const char *where) {
     _logOpControl("after manual field off");
 }
 
-ST25R3916::ST25R3916(CONNECTION_TYPE connection_type) : _connection_type(connection_type) {
-    // Pin the solver scratch now, before tag reads fragment the heap and make
-    // the 98 KiB contiguous block unavailable.
-    mfc_recovery::reserveSolverScratch();
-}
+ST25R3916::ST25R3916(CONNECTION_TYPE connection_type) : _connection_type(connection_type) {}
 
 ST25R3916::~ST25R3916() {
-    mfc_recovery::releaseSolverScratch();
     stopDiscovery();
     _setNfcPower(false);
     delete _nfc;
@@ -318,6 +314,7 @@ bool ST25R3916::begin() {
     _logOpControl("after init");
     _hw->st25r3916OscOn();
     _logOpControl("after forced osc on");
+    ST25R_LOG("begin: free heap=%lu", (unsigned long)ESP.getFreeHeap());
     return (err == ST_ERR_NONE);
 }
 
@@ -549,15 +546,18 @@ ST25R3916::RecoveryResult ST25R3916::recoverKeyStaticNonce(
     }
     ST25R_RECOVERY_LOG("static: fast-select ready, starting enumeration");
 
-    const mfc_recovery::Sample sample{nt, enc};
-    const mfc_recovery::Result r =
-        mfc_recovery::enumerateKeys(_mfcUid32(), sample, -1, _mfcStaticSink, &ctx);
+    const mfc_flipper::Sample sample{
+        _mfcUid32(), nt, enc, (uint8_t)(par[0] | (par[1] << 1) | (par[2] << 2))};
+    ST25R_RECOVERY_LOG("static: heap before solve=%lu", (unsigned long)ESP.getFreeHeap());
+    const mfc_flipper::Result r =
+        mfc_flipper::enumerateKeys(sample, _mfcStaticSink, &ctx, progress, context);
     ST25R_RECOVERY_LOG(
-        "static: tried=%lu found=%d ms=%lu result=%d",
+        "static: tried=%lu found=%d ms=%lu result=%d heap=%lu",
         (unsigned long)ctx.tried,
         ctx.found ? 1 : 0,
         (unsigned long)(millis() - ctx.started),
-        (int)r
+        (int)r,
+        (unsigned long)ESP.getFreeHeap()
     );
 
     _nfc->rfalNfcDeactivate(false);
@@ -571,9 +571,10 @@ ST25R3916::RecoveryResult ST25R3916::recoverKeyStaticNonce(
         return RecoveryResult::Verified;
     }
     if (ctx.aborted) return RecoveryResult::Unsupported;
-    if (r == mfc_recovery::Result::NoMemory) return RecoveryResult::NoMemory;
-    if (r == mfc_recovery::Result::Cancelled) return RecoveryResult::Cancelled;
-    if (r == mfc_recovery::Result::InvalidInput) return RecoveryResult::InternalError;
+    if (r == mfc_flipper::Result::NoMemory) return RecoveryResult::NoMemory;
+    if (r == mfc_flipper::Result::Cancelled) return RecoveryResult::Cancelled;
+    if (r == mfc_flipper::Result::InvalidInput) return RecoveryResult::InternalError;
+    if (r == mfc_flipper::Result::NoCandidates) return RecoveryResult::NotFound;
     return RecoveryResult::NotFound;
 }
 
@@ -710,8 +711,8 @@ bool ST25R3916::_mfcNestedAuthCapture(uint8_t block, bool useKeyB, uint32_t *enc
     uint16_t txBits = _mfcPackBits(enc, txPar, 4, tx);
     uint8_t rx[8] = {0};
     uint16_t rxBits = 0;
-    auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(20), MFC_FLAGS_ENC);
-    if (!_mfcRxOk(err) || rxBits < 32) {
+    auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(20), MFC_FLAGS_ENC, "nested");
+    if (!_mfcRxOk(err) || rxBits != 36) {
         ST25R_RECOVERY_LOG("nested capture blk=%u err=%d bits=%u", block, (int)err, rxBits);
         return false;
     }
@@ -1163,7 +1164,7 @@ bool ST25R3916::_mfcDarksideProbe(uint8_t block, bool useKeyB, uint32_t nrEnc, u
     const uint16_t txBits = _mfcPackBits(data, par, 8, tx);
     uint8_t rx[8] = {0};
     uint16_t rxBits = 0;
-    auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(20), MFC_FLAGS_ENC);
+    auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(20), MFC_FLAGS_ENC, "darkside");
     // A real darkside answer is exactly a 4-bit NAK. A framing/parity error can
     // leave 4 garbage bits in the buffer, and counting those as "answered" made
     // the preflight believe this card still had a parity oracle.
@@ -1510,7 +1511,8 @@ int ST25R3916::recoverSectorKeys(uint8_t sector, mfc_recovery::Progress progress
         if (res == RecoveryResult::Cancelled) return -2;
         if (res == RecoveryResult::NoMemory) return -3;
         if (res == RecoveryResult::NoTag || res == RecoveryResult::Unsupported ||
-            res == RecoveryResult::InternalError || res == RecoveryResult::AuthenticationFailed) {
+            res == RecoveryResult::InternalError || res == RecoveryResult::AuthenticationFailed ||
+            res == RecoveryResult::NotFound || res == RecoveryResult::UnstableNonce) {
             return -4;
         }
     }
@@ -3411,7 +3413,7 @@ static uint8_t _mfcUnpackParity(const uint8_t *in, uint16_t nbits, uint8_t *outP
 
 ::ReturnCode ST25R3916::_mifareTransceiveRaw(
     uint8_t *txBuf, uint16_t txBits, uint8_t *rxBuf, uint16_t rxCapBytes, uint16_t *rxBits, uint32_t fwt,
-    uint32_t flags
+    uint32_t flags, const char *tag
 ) {
     rfalTransceiveContext ctx;
     ctx.txBuf = txBuf;
@@ -3424,7 +3426,10 @@ static uint8_t _mfcUnpackParity(const uint8_t *in, uint16_t nbits, uint8_t *outP
 
     if (rxBits) *rxBits = 0;
     auto err = _hw->rfalStartTransceive(&ctx);
-    if (err != ST_ERR_NONE) return err;
+    if (err != ST_ERR_NONE) {
+        ST25R_LOG("mfc xcv %s start err=%d", tag, (int)err);
+        return err;
+    }
 
     uint32_t t0 = millis();
     while ((millis() - t0) < 25) {
@@ -3432,6 +3437,8 @@ static uint8_t _mfcUnpackParity(const uint8_t *in, uint16_t nbits, uint8_t *outP
         err = _hw->rfalGetTransceiveStatus();
         if (err != ST_ERR_BUSY) break;
     }
+    const uint16_t finalBits = rxBits ? *rxBits : 0;
+    ST25R_LOG("mfc xcv %s err=%d bits=%u", tag, (int)err, finalBits);
     return err;
 }
 
@@ -3456,9 +3463,10 @@ bool ST25R3916::_mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB, u
             sizeof(rx),
             &rxBits,
             rfalConvMsTo1fc(fwtMs),
-            MFC_FLAGS_FIRSTAUTH
+            MFC_FLAGS_FIRSTAUTH,
+            "auth1"
         );
-        if (!_mfcRxOk(err) || rxBits < 32) {
+        if (!_mfcRxOk(err) || rxBits != 36) {
             ST25R_LOG("mfc auth1 blk=%u no nonce err=%d bits=%u", block, (int)err, rxBits);
             return false;
         }
@@ -3481,9 +3489,10 @@ bool ST25R3916::_mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB, u
         uint16_t txBits = _mfcPackBits(enc, par, 4, tx);
         uint8_t rx[8] = {0};
         uint16_t rxBits = 0;
-        auto err =
-            _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(fwtMs), MFC_FLAGS_ENC);
-        if (!_mfcRxOk(err) || rxBits < 32) {
+        auto err = _mifareTransceiveRaw(
+            tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(fwtMs), MFC_FLAGS_ENC, "nested"
+        );
+        if (!_mfcRxOk(err) || rxBits != 36) {
             ST25R_LOG("mfc nested auth blk=%u no nonce err=%d bits=%u", block, (int)err, rxBits);
             return false;
         }
@@ -3520,8 +3529,10 @@ bool ST25R3916::_mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB, u
     uint16_t txBits = _mfcPackBits(arData, arPar, 8, tx);
     uint8_t rx[8] = {0};
     uint16_t rxBits = 0;
-    auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(fwtMs), MFC_FLAGS_ENC);
-    if (!_mfcRxOk(err) || rxBits < 32) {
+    auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(fwtMs), MFC_FLAGS_ENC, "AT");
+    // Measured AT: 36 bits on success (32 data + 4 parity), 4 bits on NAK.
+    // Keep a range because both are valid card responses; timeouts/framing fail _mfcRxOk.
+    if (!_mfcRxOk(err) || (rxBits != 36 && rxBits != 4)) {
         ST25R_LOG("mfc auth blk=%u no AT err=%d bits=%u", block, (int)err, rxBits);
         _mfcAuthed = false;
         return false;
@@ -3564,8 +3575,9 @@ bool ST25R3916::_mifareReadBlock(uint8_t block, uint8_t data[16]) {
     uint16_t txBits = _mfcPackBits(enc, par, 4, tx);
     uint8_t rx[32] = {0};
     uint16_t rxBits = 0;
-    auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(20), MFC_FLAGS_ENC);
-    if (!_mfcRxOk(err) || rxBits < (18 * 8)) {
+    auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(20), MFC_FLAGS_ENC, "read");
+    // Measured read: 18 bytes * (8 data + 1 parity) = 162 bits, stable.
+    if (!_mfcRxOk(err) || rxBits != 162) {
         ST25R_LOG("mfc read blk=%u err=%d bits=%u", block, (int)err, rxBits);
         return false;
     }
@@ -3596,7 +3608,7 @@ bool ST25R3916::_mifareWriteBlock(uint8_t block, const uint8_t data[16]) {
     uint16_t txBits = _mfcPackBits(enc, par, 4, tx);
     uint8_t rx[8] = {0};
     uint16_t rxBits = 0;
-    auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(20), MFC_FLAGS_ENC);
+    auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(20), MFC_FLAGS_ENC, "write1");
     if (!_mfcRxOk(err) || rxBits < 4) {
         ST25R_LOG("mfc write1 blk=%u err=%d bits=%u", block, (int)err, rxBits);
         return false;
@@ -3629,7 +3641,7 @@ bool ST25R3916::_mifareWriteBlock(uint8_t block, const uint8_t data[16]) {
     uint16_t txBits2 = _mfcPackBits(denc, dpar, 18, tx2);
     uint8_t rx2[8] = {0};
     uint16_t rxBits2 = 0;
-    err = _mifareTransceiveRaw(tx2, txBits2, rx2, sizeof(rx2), &rxBits2, rfalConvMsTo1fc(20), MFC_FLAGS_ENC);
+    err = _mifareTransceiveRaw(tx2, txBits2, rx2, sizeof(rx2), &rxBits2, rfalConvMsTo1fc(20), MFC_FLAGS_ENC, "write2");
     if (!_mfcRxOk(err) || rxBits2 < 4) {
         ST25R_LOG("mfc write2 blk=%u err=%d bits=%u", block, (int)err, rxBits2);
         return false;
@@ -3729,9 +3741,10 @@ bool ST25R3916::_mfcCaptureNonceRaw(
         sizeof(rx),
         &rxBits,
         rfalConvMsTo1fc(20),
-        MFC_FLAGS_FIRSTAUTH
+        MFC_FLAGS_FIRSTAUTH,
+        "auth1"
     );
-    if (!_mfcRxOk(err) || rxBits < 32) {
+    if (!_mfcRxOk(err) || rxBits != 36) {
         ST25R_LOG("mfc recover: blk=%u no nonce err=%d bits=%u", block, (int)err, rxBits);
         return false;
     }

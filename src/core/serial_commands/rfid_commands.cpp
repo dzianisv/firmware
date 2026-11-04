@@ -493,7 +493,7 @@ uint32_t rfidRecoverCallback(cmd *c) {
             serialDevice->println("Re-read failed: " + _rfid->statusMessage(again));
         }
     }
-    return recovered >= 0;
+    return recovered > 0;
 }
 
 // rfid mfckey <block> <A|B> <12-hex-key>
