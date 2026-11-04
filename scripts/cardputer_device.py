@@ -245,7 +245,10 @@ def test(args, output):
                 for spec in args.rfid_command:
                     label = "cmd-" + re.sub(r"[^a-z0-9]+", "-", spec.lower()).strip("-")
                     out = console.command(spec, label, timeout=args.command_timeout)
-                    ok = not re.search(r"\b(ERROR|FAIL|failed)\b", out)
+                    # Fallback for commands without a positive matcher: absence of an
+                    # error word is weak evidence, so an empty/content-free response
+                    # must not count as a pass.
+                    ok = bool(out.strip()) and not re.search(r"\b(ERROR|FAIL|failed)\b", out)
                     if spec.strip().startswith("rfid mfckey"):
                         ok = bool(re.search(r": PASS", out))
                     elif spec.strip().startswith("rfid mfcdarkside"):
@@ -258,7 +261,9 @@ def test(args, output):
                         pages_match = re.search(r"^Pages:\s*(\d+)", out, re.M)
                         ok = bool(pages_match) and int(pages_match.group(1)) > 0
                     elif spec.strip().startswith("rfid recover"):
-                        ok = bool(re.search(r"New keys recovered:\s*\d+", out))
+                        # "New keys recovered: 0" is the failure mode; require > 0.
+                        keys = re.search(r"New keys recovered:\s*(\d+)", out)
+                        ok = bool(keys) and int(keys.group(1)) > 0
                     first = next((l.strip() for l in reversed(out.splitlines()) if l.strip()), "")
                     record(f"serial: {spec}", ok, first[:200] or "no output")
                 if args.recover and has_tag:
@@ -274,7 +279,8 @@ def test(args, output):
                     recovery = console.command(command, "rfid-recover", timeout=args.recover_timeout)
                     count = re.search(r"New keys recovered:\s*(\d+)", recovery)
                     cancelled = "Recovery cancelled" in recovery
-                    recovery_ok = count is not None and int(count.group(1)) >= 0 and not cancelled
+                    recovered = int(count.group(1)) if count else 0
+                    recovery_ok = count is not None and recovered > 0 and not cancelled
                     record("nested key recovery", recovery_ok,
                            f"{command}: New keys recovered: {count.group(1) if count else 'cancelled'}")
                     reread = re.search(r"^Pages:\s*(\d+)", recovery, re.M)

@@ -146,6 +146,111 @@ class CardputerDeviceTest(unittest.TestCase):
             image.write_bytes(b"firmware fixture")
             self.assertEqual(DEVICE.sha256(image), hashlib.sha256(b"firmware fixture").hexdigest())
 
+    # --- Scoring regressions: zero-evidence output must never score PASS. ---
+    BASE_RESPONSES = {
+        "info": "Bruce vtest\nDevice: M5Stack Cardputer ADV\n# ",
+        "uptime": "Uptime: 00:00:01\n# ",
+        "free": "Free heap: 100000\n# ",
+        "display info": "135x240x1\n# ",
+        "nav next": "Next Pressed\n# ",
+        "i2c": "Found device at 0x50\n# ",
+        "settings rfidModule 6": "rfidModule = 6\n# ",
+        "rfid reset": "RFID reset\n# ",
+        "rfid read 3000": "Waiting for tag\nUID: 01 02 03 04\nMIFARE Classic\nPages: 12\n# ",
+    }
+
+    def run_scripted_test(self, responses, **options):
+        """Drive DEVICE.test with a scripted console and return {check name: status}."""
+        merged = dict(self.BASE_RESPONSES)
+        merged.update(responses)
+
+        class ScriptedConsole:
+            def __init__(self, port, output):
+                self.output = output
+                (output / "serial-transcript.log").write_text("scripted serial transcript\n")
+                self.serial = SimpleNamespace(reset_input_buffer=lambda: None)
+
+            def receive(self, seconds, prompt=False):
+                return "Ready\n"
+
+            def command(self, text, label, timeout=8):
+                response = merged.get(text, "")
+                (self.output / f"{label}.log").write_text(response)
+                return response
+
+            def close(self):
+                pass
+
+        args = SimpleNamespace(port="fixture", rfid=True, skip_read=False, tag_timeout=3000,
+                               read_timeout=300, require_tag=False, require_full_read=False,
+                               rfid_command=[], command_timeout=8, recover=False,
+                               recover_sector=None, recover_timeout=8)
+        for key, value in options.items():
+            setattr(args, key, value)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(DEVICE, "Console", ScriptedConsole), \
+                patch.object(DEVICE.time, "sleep", lambda *_: None):
+            root = Path(directory)
+            DEVICE.test(args, root)
+            report = json.loads((root / "test-result.json").read_text())
+        return {check["name"]: check["status"] for check in report["checks"]}
+
+    def test_zero_keys_recovered_is_a_failure(self):
+        # Old matcher accepted "New keys recovered: 0" because it only looked for digits.
+        statuses = self.run_scripted_test({"rfid recover 5000": "New keys recovered: 0\n# "},
+                                          rfid_command=["rfid recover 5000"])
+        self.assertEqual(statuses["serial: rfid recover 5000"], "FAIL")
+
+    def test_one_key_recovered_is_a_pass(self):
+        statuses = self.run_scripted_test({"rfid recover 5000": "New keys recovered: 1\n# "},
+                                          rfid_command=["rfid recover 5000"])
+        self.assertEqual(statuses["serial: rfid recover 5000"], "PASS")
+
+    def test_cancelled_recovery_command_is_a_failure(self):
+        statuses = self.run_scripted_test(
+            {"rfid recover 5000": "Recovery cancelled\nNew keys recovered: 0\n# "},
+            rfid_command=["rfid recover 5000"])
+        self.assertEqual(statuses["serial: rfid recover 5000"], "FAIL")
+
+    def test_nested_recovery_with_zero_keys_is_a_failure(self):
+        statuses = self.run_scripted_test({"rfid recover 5000": "New keys recovered: 0\n# "},
+                                          recover=True)
+        self.assertEqual(statuses["nested key recovery"], "FAIL")
+
+    def test_nested_recovery_with_keys_is_a_pass(self):
+        statuses = self.run_scripted_test(
+            {"rfid recover 5000": "New keys recovered: 1\nPages: 64\n# "}, recover=True)
+        self.assertEqual(statuses["nested key recovery"], "PASS")
+
+    def test_nested_recovery_cancelled_is_a_failure(self):
+        # Keys reported but the operator cancelled: cancellation still fails the check.
+        statuses = self.run_scripted_test(
+            {"rfid recover 5000": "New keys recovered: 2\nRecovery cancelled\nPages: 64\n# "},
+            recover=True)
+        self.assertEqual(statuses["nested key recovery"], "FAIL")
+
+    def test_rfid_read_with_zero_pages_is_a_failure(self):
+        statuses = self.run_scripted_test({"rfid read 3000": "UID: 01 02 03 04\nPages: 0\n# "},
+                                          rfid_command=["rfid read 3000"])
+        self.assertEqual(statuses["serial: rfid read 3000"], "FAIL")
+        self.assertEqual(statuses["NFC data read"], "FAIL")
+
+    def test_rfid_read_with_pages_is_a_pass(self):
+        statuses = self.run_scripted_test({}, rfid_command=["rfid read 3000"])
+        self.assertEqual(statuses["serial: rfid read 3000"], "PASS")
+        self.assertEqual(statuses["NFC data read"], "PASS")
+
+    def test_rfid_command_without_output_is_a_failure(self):
+        statuses = self.run_scripted_test({"rfid savelist": ""},
+                                          rfid_command=["rfid savelist"])
+        self.assertEqual(statuses["serial: rfid savelist"], "FAIL")
+
+    def test_rfid_command_with_plain_output_is_a_pass(self):
+        # Control: the fallback still accepts genuine non-empty evidence.
+        statuses = self.run_scripted_test({"rfid savelist": "0 keys saved\n# "},
+                                          rfid_command=["rfid savelist"])
+        self.assertEqual(statuses["serial: rfid savelist"], "PASS")
+
 
 if __name__ == "__main__":
     unittest.main()
