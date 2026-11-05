@@ -176,6 +176,8 @@ bool insertUnique(uint8_t *data, uint16_t &count, uint32_t value24) {
 struct Control {
     Progress callback;
     void *context;
+    BandReporter band = nullptr;
+    void *bandContext = nullptr;
     unsigned done = 0;
     unsigned steps = 0;
     unsigned emitted = 0;
@@ -192,6 +194,11 @@ struct Control {
     bool candidateEmitted() {
         ++emitted;
         return poll();
+    }
+    void reportBand(unsigned index, bool finished, unsigned bucketMax, bool overflow) const {
+        if (!band) return;
+        const BandReport report{index, finished, emitted, bucketMax, overflow};
+        band(report, bandContext);
     }
 };
 
@@ -407,6 +414,8 @@ Result search(Scratch &scratch, const Sample &sample, const Sink &sink, uint8_t 
     const uint32_t in = sample.uid ^ sample.nt;
     const uint32_t input = ((in >> 16 & 0xffu) | (in << 16) | (in & 0xff00u)) << 1;
     for (unsigned base = 0; base < 256; base += kBand) {
+        const unsigned band = base / kBand;
+        control.reportBand(band, false, 0, false);
         std::memset(scratch.counts, 0, sizeof(scratch.counts));
         // Exactly 2^20 semi-states, as upstream: 2^20 itself is excluded.
         for (uint32_t semi = 0; semi < (1u << 20); ++semi) {
@@ -416,19 +425,31 @@ Result search(Scratch &scratch, const Sample &sample, const Sink &sink, uint8_t 
                 const uint32_t half = side ? eks : oks;
                 if (f != (half & 1u)) continue;
                 const Step step = enumerate12(semi, half, side, base, input, scratch);
-                if (step == Step::Overflow) return Result::NoMemory;
+                if (step == Step::Overflow) {
+                    control.reportBand(band, true, kBucketCapacity, true);
+                    return Result::NoMemory;
+                }
                 if (step != Step::Continue) return Result::Cancelled;
             }
         }
+        unsigned bucketMax = 0;
         for (unsigned bucket = 0; bucket < kBand; ++bucket) {
+            const unsigned filled = scratch.counts[0][bucket] > scratch.counts[1][bucket]
+                                        ? scratch.counts[0][bucket]
+                                        : scratch.counts[1][bucket];
+            if (filled > bucketMax) bucketMax = filled;
             if (!control.poll()) return Result::Cancelled;
             const Step step =
                 join(scratch, bucket, oks, eks, input >> 16, sample, sink, key, control);
             if (step == Step::Stop) return Result::Ok;
-            if (step == Step::Overflow) return Result::NoMemory;
+            if (step == Step::Overflow) {
+                control.reportBand(band, true, bucketMax, true);
+                return Result::NoMemory;
+            }
             if (step != Step::Continue) return Result::Cancelled;
             ++control.done;
         }
+        control.reportBand(band, true, bucketMax, false);
     }
     return control.poll() ? Result::Ok : Result::Cancelled;
 }
@@ -440,9 +461,11 @@ size_t scratchBytes() { return kScratchTotal; }
 size_t maxAllocationBytes() { return kWorkBytes > kBucketBytes ? kWorkBytes : kBucketBytes; }
 
 Result enumerateKeys(const Sample &s, CandidateSink sink, void *ctx, Progress progress,
-                     void *progressContext) {
+                     void *progressContext, BandReporter bandReporter, void *bandContext) {
     if (!sink || s.parBits > 7) return Result::InvalidInput;
     Control control{progress, progressContext};
+    control.band = bandReporter;
+    control.bandContext = bandContext;
     if (!control.poll()) return Result::Cancelled;
     Scratch scratch;
     if (!scratch.allocate()) return Result::NoMemory;

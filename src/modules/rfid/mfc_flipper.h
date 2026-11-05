@@ -54,6 +54,20 @@ using CandidateSink = bool (*)(const uint8_t key[6], void *ctx);
 // after every candidate. `done` counts finished buckets of `total` (256).
 using Progress = bool (*)(unsigned done, unsigned total, void *ctx);
 
+// Band boundary report. The sweep runs 32 bands of 8 MSB buckets; a band is the
+// only place the solver does long work with no candidate to offer, so its start
+// and end are the boundaries a stall watchdog has to see. Called twice per band,
+// with `finished` false before the 2^20 semi-state sweep and true after the
+// band's eight buckets have been joined.
+struct BandReport {
+    unsigned band;       // 0..31
+    bool finished;       // false = sweep about to start, true = buckets joined
+    unsigned candidates; // candidates offered to the sink so far
+    unsigned bucketMax;  // largest per-bucket candidate table this band required
+    bool overflow;       // fixed capacity was exceeded -> Result::NoMemory
+};
+using BandReporter = void (*)(const BandReport &report, void *ctx);
+
 // Enumerate every key consistent with the sample's 32-bit keystream window and
 // its three parity bits. Keys are six bytes, most significant byte first.
 // Emission order is deterministic for a given sample.
@@ -63,7 +77,8 @@ using Progress = bool (*)(unsigned done, unsigned total, void *ctx);
 // Nothing else is allocated. Verification is deliberately NOT part of this
 // module.
 Result enumerateKeys(const Sample &s, CandidateSink sink, void *ctx,
-                     Progress progress = nullptr, void *progressContext = nullptr);
+                     Progress progress = nullptr, void *progressContext = nullptr,
+                     BandReporter bandReporter = nullptr, void *bandContext = nullptr);
 
 // Total scratch the solver requests, in bytes (<= 61440).
 size_t scratchBytes();

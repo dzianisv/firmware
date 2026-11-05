@@ -54,6 +54,7 @@ public:
         NotFound,
         Cancelled,
         NoMemory,
+        Stalled, // no progress for the watchdog window; see the state dump
         InternalError
     };
     static const char *recoveryStatus(RecoveryResult);
@@ -103,6 +104,21 @@ public:
     // Register a key recovered elsewhere so a later `rfid read` can open the
     // sector. No effect on the card.
     static void rememberRecoveredKey(const uint8_t key[6]);
+
+    // True when a key that can bootstrap recovery is already in memory: one
+    // recovered earlier in this boot (`rfid mfcaddkey`, a previous `rfid
+    // recover`) or one from the user dictionary. A targeted recovery needs only
+    // one such key, so the 55-key x 16-trailer pre-pass can be skipped.
+    bool hasBootstrapKey();
+    // When enabled, the next MIFARE Classic read only tries the keys already in
+    // memory and stops at the first sector it opens: no built-in dictionary
+    // scan, no block reads. Cleared by the caller straight after the read.
+    void setBootstrapOnlyRead(bool on) { _mfcBootstrapOnly = on; }
+
+    // Start/stop the recovery stall watchdog. Nested-safe: a recovery that runs
+    // inside another watched section does not clear the outer heartbeat.
+    void recoveryWatchStart();
+    void recoveryWatchStop();
 
     // Read-only diagnostic: log nonce/parity/PRNG-distance values for a known
     // key (same-block nested auth) and for a target block. No key material is
@@ -201,6 +217,9 @@ private:
     // card really stops answering.
     bool _mfcReacquire(uint32_t timeoutMs, int attempts);
     static bool _mfcStaticSink(const uint8_t key[6], void *context);
+    // Wraps the caller's progress callback so the stall watchdog can cancel the
+    // sweep, and keeps the heartbeat alive between candidates.
+    static bool _mfcGuardedProgress(unsigned done, unsigned total, void *context);
     struct StaticSinkCtx {
         ST25R3916 *self = nullptr;
         uint8_t block = 0;
@@ -217,6 +236,8 @@ private:
         void *progressContext = nullptr;
     };
     bool _mfcLastSelectOk = false;
+    bool _mfcBootstrapOnly = false; // next read: memory keys only, stop at first
+    bool _mfcXcvVerbose = true;     // per-frame transceive logging (recovery throttles it)
     RecoveryResult _mfcMeasureNtDistance(uint8_t knownBlock, const uint8_t knownKey[6], bool knownB,
                                          uint32_t *distOut);
     bool _mfcDarksideSelect(uint32_t timeoutMs = 500);

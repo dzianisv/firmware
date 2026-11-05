@@ -34,6 +34,8 @@ std::atomic<size_t> gPeak{0};
 std::atomic<size_t> gMaxAlloc{0};
 std::atomic<unsigned> gAllocations{0};
 std::atomic<unsigned> gGlobalNewCalls{0};
+// 0 = never fail, else the 1-based allocation number that returns null.
+std::atomic<unsigned> gFailAt{0};
 
 struct BlockHeader {
     size_t bytes;
@@ -53,6 +55,10 @@ void noteAllocation(size_t bytes) {
 } // namespace
 
 void *mfc_flipper_test_allocate(size_t bytes) {
+    // Fault injection: make allocation number gFailAt return null, so the
+    // NoMemory path (and its release) is exercised without hardware.
+    static std::atomic<unsigned> calls{0};
+    if (gFailAt.load() != 0 && calls.fetch_add(1) + 1 == gFailAt.load()) return nullptr;
     BlockHeader *header = static_cast<BlockHeader *>(std::malloc(bytes + sizeof(BlockHeader)));
     if (!header) return nullptr;
     header->bytes = bytes;
@@ -290,6 +296,78 @@ struct Lcg {
 
 } // namespace
 
+// --- 7. Band reporting: the sweep visits every band once, in order ---------
+// The hardware silent-hang of 2026-11-04 happened mid-sweep with no candidate
+// offered for minutes. The band boundary is the only place the solver does long
+// work without a candidate, so it must be observable, and it must be reached a
+// bounded number of times: a solver looping in a band would repeat entries.
+struct BandTally {
+    unsigned beginCalls = 0;
+    unsigned endCalls = 0;
+    unsigned lastBand = 0;
+    bool orderOk = true;
+    unsigned bucketMax = 0;
+    unsigned candidatesAtEnd = 0;
+};
+
+void bandReport(const mfc_flipper::BandReport &r, void *ctx) {
+    BandTally *t = static_cast<BandTally *>(ctx);
+    if (!r.finished) {
+        if (t->beginCalls > 0 && r.band != t->lastBand + 1) t->orderOk = false;
+        t->lastBand = r.band;
+        ++t->beginCalls;
+    } else {
+        ++t->endCalls;
+        if (r.bucketMax > t->bucketMax) t->bucketMax = r.bucketMax;
+        t->candidatesAtEnd = r.candidates;
+    }
+}
+
+void checkBands(const mfc_flipper::Sample &s, const char *name) {
+    BandTally tally;
+    CollectCtx c;
+    c.keys.reserve(200000);
+    const mfc_flipper::Result r =
+        mfc_flipper::enumerateKeys(s, collectSink, &c, nullptr, nullptr, bandReport, &tally);
+    printf(
+        "%s: result=%d candidates=%zu bands=%u/%u order_ok=%d bucket_max=%u\n",
+        name,
+        (int)r,
+        c.keys.size(),
+        tally.beginCalls,
+        tally.endCalls,
+        tally.orderOk ? 1 : 0,
+        tally.bucketMax
+    );
+    check(tally.beginCalls == 32, "every band is entered exactly once");
+    check(tally.endCalls == 32, "every band is finished exactly once");
+    check(tally.orderOk, "bands are swept in ascending order");
+    check(tally.bucketMax < 896, "bucket fill stays inside the fixed capacity");
+    check(tally.candidatesAtEnd == c.keys.size(), "reported candidate count matches the sink");
+    check(r == mfc_flipper::Result::Ok, "band sweep completes with Ok");
+}
+
+// --- 8. Fixed-capacity paths --------------------------------------------
+// The solver must fail cleanly (NoMemory) when a scratch block cannot be
+// allocated, and it must not leak the blocks it already took: on the Cardputer
+// a leak here permanently removes the only block large enough to retry.
+void checkAllocationFailure(const mfc_flipper::Sample &s) {
+    CollectCtx c;
+    const size_t baseline = gLive.load();
+    gFailAt.store(5); // a bucket block, halfway through allocate()
+    const mfc_flipper::Result r = mfc_flipper::enumerateKeys(s, collectSink, &c);
+    gFailAt.store(0);
+    printf(
+        "alloc-fail: result=%d live_bytes=%zu candidate_calls=%zu\n",
+        (int)r,
+        gLive.load() - baseline,
+        c.keys.size()
+    );
+    check(r == mfc_flipper::Result::NoMemory, "failed allocation -> NoMemory");
+    check(c.keys.empty(), "no candidate is verified without scratch");
+    check(gLive.load() == baseline, "partially allocated scratch is released");
+}
+
 int main() {
     printf("module reports: scratch_bytes=%zu max_alloc_bytes=%zu\n", mfc_flipper::scratchBytes(),
            mfc_flipper::maxAllocationBytes());
@@ -434,6 +512,25 @@ int main() {
             mfc_flipper::enumerateKeys(s, cancelSink, &unused);
         check(badParity == mfc_flipper::Result::InvalidInput, "parBits > 7 -> InvalidInput");
         printf("validation: null_sink=%d par_bits_8=%d\n", (int)noSink, (int)badParity);
+    }
+
+    // --- 7. Band boundaries and the two windows that stalled on hardware ----
+    {
+        // uid/nt/keystream/parity of the two sweeps that went silent on the
+        // Cardputer (evidence 20261104-092505 sector 5, 20261104-100626 sector
+        // 6). No key material: a keystream window is not a key.
+        mfc_flipper::Sample sector5{0x1F47B5D9u, 0x01200145u, 0x14BD9244u, 7};
+        mfc_flipper::Sample sector6{0x1F47B5D9u, 0x01200145u, 0x823E268Au, 6};
+        mfc_flipper::Sample sector1{0x1F47B5D9u, 0x01200145u, 0x044C698Au, 4};
+        checkBands(sector5, "band/sector5");
+        checkBands(sector6, "band/sector6");
+        checkBands(sector1, "band/sector1");
+    }
+
+    // --- 8. Allocation failure releases everything -------------------------
+    {
+        const Vector v{0x1F47B5D9u, 0x01200145u, 0x112233445566ULL};
+        checkAllocationFailure(sampleFor(v));
     }
 
     if (gFailures) {

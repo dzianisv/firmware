@@ -20,7 +20,151 @@
 #include <globals.h>
 
 static uint8_t _mfcUnpackParity(const uint8_t *in, uint16_t nbits, uint8_t *outPar, uint8_t maxBytes);
-static void _mfcRememberKey(const uint8_t key[6]);
+
+// Keys recovered at runtime by `rfid recover`. They survive the dump reset that
+// a fresh `rfid read` performs, so a recovery immediately followed by a read can
+// open the sector it just cracked. Declared here because the bootstrap-only read
+// and hasBootstrapKey() consult them before their old definition site.
+static constexpr int MFC_EXTRA_KEY_SLOTS = 8;
+static uint8_t _mfcExtraKeys[MFC_EXTRA_KEY_SLOTS][6] = {};
+static int _mfcExtraKeyCount = 0;
+
+static void _mfcRememberKey(const uint8_t key[6]) {
+    if (!key) return;
+    for (int i = 0; i < _mfcExtraKeyCount; i++) {
+        if (memcmp(_mfcExtraKeys[i], key, 6) == 0) return;
+    }
+    if (_mfcExtraKeyCount >= MFC_EXTRA_KEY_SLOTS) return;
+    memcpy(_mfcExtraKeys[_mfcExtraKeyCount++], key, 6);
+}
+
+// ---------------------------------------------------------------------------
+// Recovery phase + stall watchdog.
+//
+// The 2026-11-04 runs went completely silent mid-sweep with no panic and a
+// stable heap, so "it hung" was indistinguishable from "it is slow". Every step
+// that can block now publishes a phase, and a separate task turns 10 s of no
+// progress into a state dump plus an aborted enumeration (and, at 30 s, into a
+// hard stop) instead of an unreadable silence.
+// ---------------------------------------------------------------------------
+enum : uint8_t {
+    MFC_PH_IDLE = 0,
+    MFC_PH_READ,
+    MFC_PH_WUPA,
+    MFC_PH_SELECT,
+    MFC_PH_AUTH1,
+    MFC_PH_AT,
+    MFC_PH_NESTED,
+    MFC_PH_HALT,
+    MFC_PH_SOLVE,
+    MFC_PH_SINK,
+    _MFC_PH_COUNT
+};
+static const char *const kMfcPhaseNames[_MFC_PH_COUNT] = {
+    "idle", "read", "wupa", "select", "auth1", "at", "nested", "halt", "solve", "sink"
+};
+
+// Written by the recovery path, read by the monitor task. millis() based, so
+// wrap-around is harmless.
+static volatile uint8_t gMfcPhase = MFC_PH_IDLE;
+static volatile uint32_t gMfcPhaseAt = 0;
+static volatile uint32_t gMfcBeatAt = 0; // 0 = no recovery running
+static volatile uint32_t gMfcTried = 0;
+static volatile int16_t gMfcBandNow = -1;
+static volatile int16_t gMfcBucketNow = -1;
+static volatile bool gMfcAbort = false;
+static bool gMfcMonitorStarted = false;
+static int gMfcWatchDepth = 0;
+
+static inline void _mfcPhase(uint8_t phase) {
+    gMfcPhase = phase;
+    gMfcPhaseAt = millis();
+    gMfcBeatAt = gMfcPhaseAt;
+}
+static inline void _mfcBeat() { gMfcBeatAt = millis(); }
+
+static void _mfcWatchStart() {
+    if (gMfcWatchDepth++ > 0) return;
+    gMfcAbort = false;
+    gMfcTried = 0;
+    gMfcBandNow = -1;
+    gMfcBucketNow = -1;
+    _mfcPhase(MFC_PH_IDLE);
+}
+
+static void _mfcWatchStop() {
+    if (--gMfcWatchDepth > 0) return;
+    gMfcWatchDepth = 0;
+    gMfcBeatAt = 0;
+    gMfcPhase = MFC_PH_IDLE;
+    gMfcAbort = false;
+}
+
+static void _mfcStallDump(const char *what, uint32_t age) {
+    const uint8_t phase = gMfcPhase;
+    Serial.printf(
+        "[MFC] %s: no progress for %lums phase=%s band=%d bucket=%d tried=%lu heap=%lu\n",
+        what,
+        (unsigned long)age,
+        phase < _MFC_PH_COUNT ? kMfcPhaseNames[phase] : "?",
+        (int)gMfcBandNow,
+        (int)gMfcBucketNow,
+        (unsigned long)gMfcTried,
+        (unsigned long)ESP.getFreeHeap()
+    );
+}
+
+// Independent task, so a main loop that stops printing still reports. A band
+// sweep legitimately runs for seconds with nothing to say, so it gets 30 s; every
+// other phase that stays put for 10 s is a stall.
+static void _mfcMonitorTask(void *) {
+    bool dumped = false;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        const uint32_t beat = gMfcBeatAt;
+        if (!beat) {
+            dumped = false;
+            continue;
+        }
+        const uint32_t age = millis() - beat;
+        const uint32_t limit = (gMfcPhase == MFC_PH_SOLVE) ? 30000u : 10000u;
+        if (age < limit) continue;
+        if (!dumped) {
+            dumped = true;
+            _mfcStallDump("STALL", age);
+            continue;
+        }
+        if (!gMfcAbort) {
+            gMfcAbort = true;
+            _mfcStallDump("STALL", age);
+            Serial.println("[MFC] STALL: aborting enumeration");
+        }
+    }
+}
+
+static void _mfcWatchBegin() {
+    if (gMfcMonitorStarted) return;
+    gMfcMonitorStarted = true;
+    xTaskCreatePinnedToCore(_mfcMonitorTask, "mfcwatch", 3072, nullptr, 1, nullptr, 0);
+}
+
+// 64 lines per full sweep: the only boundaries where the solver can spend a long
+// time without offering a candidate.
+static void _mfcBandReport(const mfc_flipper::BandReport &report, void *) {
+    gMfcBandNow = (int16_t)report.band;
+    gMfcTried = report.candidates;
+    if (!report.finished) _mfcPhase(MFC_PH_SOLVE); // long, quiet, legitimate
+    _mfcBeat();
+    Serial.printf(
+        "[MFC] flip band=%u %s cand=%u bucket_max=%u overflow=%d heap=%lu\n",
+        report.band,
+        report.finished ? "end" : "begin",
+        report.candidates,
+        report.bucketMax,
+        report.overflow ? 1 : 0,
+        (unsigned long)ESP.getFreeHeap()
+    );
+}
 
 // The solver runs for tens of seconds on the ESP32-S3. Yield at least every
 // 100 ms so the task watchdog and UI stay alive when the caller passes no
@@ -460,10 +604,23 @@ const char *ST25R3916::recoveryStatus(RecoveryResult res) {
         case RecoveryResult::NotFound: return "NotFound";
         case RecoveryResult::Cancelled: return "Cancelled";
         case RecoveryResult::NoMemory: return "NoMemory";
+        case RecoveryResult::Stalled: return "Stalled";
         case RecoveryResult::InternalError: return "InternalError";
     }
     return "InternalError";
 }
+
+bool ST25R3916::hasBootstrapKey() {
+    bruceConfig.ensureMifareKeysLoaded();
+    return _mfcExtraKeyCount > 0 || !bruceConfig.mifareKeys.empty();
+}
+
+void ST25R3916::recoveryWatchStart() {
+    _mfcWatchBegin();
+    _mfcWatchStart();
+}
+
+void ST25R3916::recoveryWatchStop() { _mfcWatchStop(); }
 
 ST25R3916::RecoveryResult ST25R3916::recoverKeyStaticNonce(
     uint8_t knownBlock, const uint8_t knownKey[6], bool knownB, uint8_t targetBlock, bool targetB,
@@ -549,14 +706,28 @@ ST25R3916::RecoveryResult ST25R3916::recoverKeyStaticNonce(
     const mfc_flipper::Sample sample{
         _mfcUid32(), nt, enc, (uint8_t)(par[0] | (par[1] << 1) | (par[2] << 2))};
     ST25R_RECOVERY_LOG("static: heap before solve=%lu", (unsigned long)ESP.getFreeHeap());
-    const mfc_flipper::Result r =
-        mfc_flipper::enumerateKeys(sample, _mfcStaticSink, &ctx, progress, context);
+    _mfcWatchBegin();
+    _mfcWatchStart();
+    _mfcXcvVerbose = true; // one full per-frame cycle, then the sweep goes quiet
+    const mfc_flipper::Result r = mfc_flipper::enumerateKeys(
+        sample,
+        _mfcStaticSink,
+        &ctx,
+        _mfcGuardedProgress,
+        &ctx,
+        _mfcBandReport,
+        &ctx
+    );
+    _mfcXcvVerbose = true;
+    const bool stalled = gMfcAbort;
+    _mfcWatchStop();
     ST25R_RECOVERY_LOG(
-        "static: tried=%lu found=%d ms=%lu result=%d heap=%lu",
+        "static: tried=%lu found=%d ms=%lu result=%d stalled=%d heap=%lu",
         (unsigned long)ctx.tried,
         ctx.found ? 1 : 0,
         (unsigned long)(millis() - ctx.started),
         (int)r,
+        stalled ? 1 : 0,
         (unsigned long)ESP.getFreeHeap()
     );
 
@@ -570,6 +741,7 @@ ST25R3916::RecoveryResult ST25R3916::recoverKeyStaticNonce(
         _mfcRememberKey(ctx.key);
         return RecoveryResult::Verified;
     }
+    if (stalled) return RecoveryResult::Stalled;
     if (ctx.aborted) return RecoveryResult::Unsupported;
     if (r == mfc_flipper::Result::NoMemory) return RecoveryResult::NoMemory;
     if (r == mfc_flipper::Result::Cancelled) return RecoveryResult::Cancelled;
@@ -581,16 +753,31 @@ ST25R3916::RecoveryResult ST25R3916::recoverKeyStaticNonce(
 bool ST25R3916::_mfcStaticSink(const uint8_t key[6], void *context) {
     auto *ctx = static_cast<StaticSinkCtx *>(context);
     if (!ctx || !ctx->self) return true;
+    if (gMfcAbort) {
+        // The watchdog gave up on this sweep; stop offering candidates.
+        ctx->aborted = true;
+        return true;
+    }
     ctx->tried++;
+    gMfcTried = ctx->tried;
+    // Per-frame logging only for the first candidates: after that the sweep must
+    // run at full speed, and a silent gap is diagnosed by the phase dump instead.
+    ctx->self->_mfcXcvVerbose = ctx->tried <= 512u;
+    const uint32_t tEnter = millis();
+    const uint8_t previousPhase = gMfcPhase;
+    _mfcPhase(MFC_PH_SINK);
     if (ctx->progress && (ctx->tried & 0xFFu) == 0) {
-        const unsigned done = (unsigned)((ctx->tried * 256u) / 65536u);
         ST25R_RECOVERY_LOG(
-            "static: avg select=%luus auth=%luus tries=%lu",
+            "static: avg select=%luus auth=%luus tries=%lu phase=%s",
             (unsigned long)(ctx->selectUs / ctx->tried),
             (unsigned long)(ctx->authUs / ctx->tried),
-            (unsigned long)ctx->tried
+            (unsigned long)ctx->tried,
+            kMfcPhaseNames[gMfcPhase]
         );
-        if (!ctx->progress(done, 256, ctx->progressContext)) {
+        // Candidate progress is not bucket progress: pass a fixed value so the
+        // shared callback does not print a false "Recovering: n/256", but still
+        // gets the chance to cancel.
+        if (!ctx->progress(0, 256, ctx->progressContext)) {
             ctx->aborted = true;
             return true;
         }
@@ -618,7 +805,27 @@ bool ST25R3916::_mfcStaticSink(const uint8_t key[6], void *context) {
     } else {
         ctx->selectFails = 0;
     }
+    // A candidate that took an unusual amount of time is a symptom, not noise.
+    const uint32_t dt = millis() - tEnter;
+    if (dt > 200 || !selOk) {
+        ST25R_RECOVERY_LOG(
+            "sink out n=%lu ok=%d step=%d dt=%lums",
+            (unsigned long)ctx->tried,
+            selOk ? 1 : 0,
+            (int)ctx->self->_mfcFastSelectStep,
+            (unsigned long)dt
+        );
+    }
+    gMfcPhase = previousPhase;
+    _mfcBeat();
     return false;
+}
+
+bool ST25R3916::_mfcGuardedProgress(unsigned done, unsigned total, void *context) {
+    auto *ctx = static_cast<StaticSinkCtx *>(context);
+    _mfcBeat();
+    if (gMfcAbort) return false;
+    return !ctx || !ctx->progress || ctx->progress(done, total, ctx->progressContext);
 }
 
 bool ST25R3916::_mfcPrepareFast() {
@@ -672,7 +879,9 @@ bool ST25R3916::_mfcFastSelect() {
     }
     for (int attempt = 0; attempt < 2; attempt++) {
         rfalNfcaSensRes sens;
+        _mfcPhase(MFC_PH_WUPA);
         if (_nfc->rfalNfcaPollerCheckPresence(RFAL_14443A_SHORTFRAME_CMD_WUPA, &sens) == ST_ERR_NONE) {
+            _mfcPhase(MFC_PH_SELECT);
             if (_mfcDirectSelect()) {
                 _mfcFastSelectStep = 0;
                 _mfcAuthed = false;
@@ -683,6 +892,7 @@ bool ST25R3916::_mfcFastSelect() {
         }
         _mfcFastSelectStep = 2;
         // A card left ACTIVE ignores WUPA; halt it and retry once.
+        _mfcPhase(MFC_PH_HALT);
         _mfcHalt();
         delay(1);
     }
@@ -1390,6 +1600,7 @@ int ST25R3916::recoverAllKeys(mfc_recovery::Progress progress, void *context) {
         if (r == -2) return -2;
         if (r == -3) return -3;
         if (r == -4) return -4;
+        if (r == -5) return -5;
         if (r > 0) found += r;
     }
     if (found > 0) _mfcRebuildStrAllPages();
@@ -1464,12 +1675,14 @@ int ST25R3916::recoverSectorKeys(uint8_t sector, mfc_recovery::Progress progress
                                    useB ? 'B' : 'A', recoveryStatus(sn));
                 staticTried = true;
                 if (sn == RecoveryResult::Verified || sn == RecoveryResult::AlreadyKnown ||
-                    sn == RecoveryResult::Cancelled || sn == RecoveryResult::NoMemory) {
+                    sn == RecoveryResult::Cancelled || sn == RecoveryResult::NoMemory ||
+                    sn == RecoveryResult::Stalled) {
                     res = sn;
                 }
             }
             if (res != RecoveryResult::Verified && res != RecoveryResult::AlreadyKnown &&
-                res != RecoveryResult::Cancelled && res != RecoveryResult::NoMemory) {
+                res != RecoveryResult::Cancelled && res != RecoveryResult::NoMemory &&
+                res != RecoveryResult::Stalled) {
                 ST25R_RECOVERY_LOG("recoverSector: sector %u key %c trying darkside", sector,
                                    useB ? 'B' : 'A');
                 auto ds = recoverKeyDarkside(trailer, useB != 0, key, progress, context);
@@ -1510,6 +1723,7 @@ int ST25R3916::recoverSectorKeys(uint8_t sector, mfc_recovery::Progress progress
         }
         if (res == RecoveryResult::Cancelled) return -2;
         if (res == RecoveryResult::NoMemory) return -3;
+        if (res == RecoveryResult::Stalled) return -5;
         if (res == RecoveryResult::NoTag || res == RecoveryResult::Unsupported ||
             res == RecoveryResult::InternalError || res == RecoveryResult::AuthenticationFailed ||
             res == RecoveryResult::NotFound || res == RecoveryResult::UnstableNonce) {
@@ -3335,18 +3549,6 @@ static uint32_t _mfcRecoveredPrngState = 0;
 // Keys recovered at runtime by `rfid recover`. They survive the dump reset that
 // a fresh `rfid read` performs, so a recovery immediately followed by a read
 // can open the sector it just cracked.
-static constexpr int MFC_EXTRA_KEY_SLOTS = 8;
-static uint8_t _mfcExtraKeys[MFC_EXTRA_KEY_SLOTS][6] = {};
-static int _mfcExtraKeyCount = 0;
-
-static void _mfcRememberKey(const uint8_t key[6]) {
-    if (!key) return;
-    for (int i = 0; i < _mfcExtraKeyCount; i++) {
-        if (memcmp(_mfcExtraKeys[i], key, 6) == 0) return;
-    }
-    if (_mfcExtraKeyCount >= MFC_EXTRA_KEY_SLOTS) return;
-    memcpy(_mfcExtraKeys[_mfcExtraKeyCount++], key, 6);
-}
 
 // Pack data+parity into an ISO14443-A bitstream (LSB first, 9 bits per byte).
 static uint16_t _mfcPackBits(const uint8_t *data, const uint8_t *par, uint8_t nbytes, uint8_t *out) {
@@ -3425,9 +3627,14 @@ static uint8_t _mfcUnpackParity(const uint8_t *in, uint16_t nbits, uint8_t *outP
     ctx.fwt = fwt;
 
     if (rxBits) *rxBits = 0;
+    const uint32_t startUs = micros();
+    if (_mfcXcvVerbose) {
+        ST25R_LOG("mfc xcv %s start phase=%s", tag, kMfcPhaseNames[gMfcPhase]);
+    }
     auto err = _hw->rfalStartTransceive(&ctx);
     if (err != ST_ERR_NONE) {
         ST25R_LOG("mfc xcv %s start err=%d", tag, (int)err);
+        _mfcBeat();
         return err;
     }
 
@@ -3438,7 +3645,22 @@ static uint8_t _mfcUnpackParity(const uint8_t *in, uint16_t nbits, uint8_t *outP
         if (err != ST_ERR_BUSY) break;
     }
     const uint16_t finalBits = rxBits ? *rxBits : 0;
-    ST25R_LOG("mfc xcv %s err=%d bits=%u", tag, (int)err, finalBits);
+    if (err == ST_ERR_BUSY) {
+        // The frame never completed inside the wrapper cap. Say so: without this
+        // line a 25 ms abandoned frame looks exactly like a fast failure.
+        ST25R_LOG("mfc xcv %s ABANDONED, still BUSY after %luus", tag,
+                  (unsigned long)(micros() - startUs));
+    }
+    if (_mfcXcvVerbose) {
+        ST25R_LOG(
+            "mfc xcv %s err=%d bits=%u us=%lu",
+            tag,
+            (int)err,
+            finalBits,
+            (unsigned long)(micros() - startUs)
+        );
+    }
+    _mfcBeat();
     return err;
 }
 
@@ -3456,6 +3678,7 @@ bool ST25R3916::_mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB, u
         uint8_t tx[4] = {cmd[0], cmd[1], (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8)};
         uint8_t rx[8] = {0};
         uint16_t rxBits = 0;
+        _mfcPhase(MFC_PH_AUTH1);
         auto err = _mifareTransceiveRaw(
             tx,
             (uint16_t)rfalConvBytesToBits(4),
@@ -3489,6 +3712,7 @@ bool ST25R3916::_mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB, u
         uint16_t txBits = _mfcPackBits(enc, par, 4, tx);
         uint8_t rx[8] = {0};
         uint16_t rxBits = 0;
+        _mfcPhase(MFC_PH_NESTED);
         auto err = _mifareTransceiveRaw(
             tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(fwtMs), MFC_FLAGS_ENC, "nested"
         );
@@ -3529,6 +3753,7 @@ bool ST25R3916::_mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB, u
     uint16_t txBits = _mfcPackBits(arData, arPar, 8, tx);
     uint8_t rx[8] = {0};
     uint16_t rxBits = 0;
+    _mfcPhase(MFC_PH_AT);
     auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(fwtMs), MFC_FLAGS_ENC, "AT");
     // Measured AT: 36 bits on success (32 data + 4 parity), 4 bits on NAK.
     // Keep a range because both are valid card responses; timeouts/framing fail _mfcRxOk.
@@ -3667,9 +3892,13 @@ void ST25R3916::_mfcHalt() {
     halt[3] = (uint8_t)(crc >> 8);
     uint8_t rx[4] = {0};
     uint16_t rxLen = 0;
+    const uint8_t previous = gMfcPhase;
+    _mfcPhase(MFC_PH_HALT);
     _hw->rfalTransceiveBlockingTxRx(
         halt, sizeof(halt), rx, sizeof(rx), &rxLen, RFAL_TXRX_FLAGS_CRC_TX_MANUAL, rfalConvMsTo1fc(5)
     );
+    gMfcPhase = previous;
+    _mfcBeat();
     _mfcAuthed = false;
 }
 
@@ -3911,6 +4140,9 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
     memset(_mfcKeyBFound, 0, sizeof(_mfcKeyBFound));
     mfcLoaded = false;
     _mfcAuthed = false;
+    // Only the keys already in memory, and only until the first sector opens:
+    // a targeted recovery needs one bootstrap key, not a full dump.
+    const bool bootstrapOnly = _mfcBootstrapOnly;
 
     if (uid.sak == 0x18 || uid.sak == 0x38) {
         mfcDump.sectors = 40;
@@ -3942,9 +4174,10 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
         bool usedKeyB = false;
         bool cardLost = false;
         uint8_t usedKeyBytes[6] = {0};
+        _mfcPhase(MFC_PH_READ);
 
         // Try Key A then Key B from the builtin dictionary.
-        for (int useB = 0; useB <= 1 && !authed && !cardLost; useB++) {
+        for (int useB = 0; useB <= 1 && !authed && !cardLost && !bootstrapOnly; useB++) {
             for (int kidx = 0; kidx < nKeys; kidx++) {
                 if (_mifareAuth(trailer, keys[kidx], useB != 0)) {
                     authed = true;
@@ -4057,6 +4290,13 @@ int ST25R3916::_readMifareClassic(rfalNfcDevice *dev) {
         } else {
             memcpy(mfcDump.keyA[s], usedKeyBytes, 6);
             mfcDump.keyAFound[s] = true;
+        }
+        _mfcBeat();
+
+        if (bootstrapOnly) {
+            // One key is all a targeted recovery needs; no block reads.
+            ST25R_RECOVERY_LOG("read: bootstrap key on sector %u, stopping", s);
+            break;
         }
 
         for (uint8_t bo = 0; bo < nBlocks; bo++) {

@@ -393,19 +393,35 @@ uint32_t rfidRecoverCallback(cmd *c) {
     }
 
     ST25R3916 *st25r = static_cast<ST25R3916 *>(_rfid);
+    const String sectorValue = cmd.getArgument("sector").getValue();
+    const bool oneSector = sectorValue.length() > 0 && sectorValue.toInt() >= 0;
+    // A targeted recovery needs one bootstrap key, not a 55-key x 16-trailer
+    // scan. When a key is already in memory (recovered earlier in this boot, or
+    // the user dictionary) read only what is needed to bootstrap.
+    const bool skipPrepass = oneSector && st25r->hasBootstrapKey();
+    if (skipPrepass) {
+        serialDevice->println(
+            "recover: skipping dictionary pre-pass (targeted sector, bootstrap key known)"
+        );
+        st25r->setBootstrapOnlyRead(true);
+    }
+    st25r->recoveryWatchStart();
     int result = _readTagWithTimeout(timeout_ms);
+    st25r->setBootstrapOnlyRead(false);
     const bool partialMfc = result == RFIDInterface::FAILURE && st25r->mfcDump.sectors > 0;
     if (result != RFIDInterface::SUCCESS && !partialMfc) {
+        st25r->recoveryWatchStop();
         serialDevice->println("Read failed: " + _rfid->statusMessage(result));
         return false;
     }
-    if (partialMfc) {
+    if (partialMfc && !skipPrepass) {
         serialDevice->println("MIFARE Classic detected but no block readable; trying darkside.");
     }
     serialDevice->println("UID:  " + _rfid->printableUID.uid);
     serialDevice->println("Type: " + _rfid->printableUID.picc_type);
 
     if (st25r->mfcDump.sectors == 0) {
+        st25r->recoveryWatchStop();
         serialDevice->println("Not a MIFARE Classic card.");
         return false;
     }
@@ -446,17 +462,20 @@ uint32_t rfidRecoverCallback(cmd *c) {
         return true;
     };
 
-    const String sectorValue = cmd.getArgument("sector").getValue();
-    const bool oneSector = sectorValue.length() > 0 && sectorValue.toInt() >= 0;
     const int recovered = oneSector
                               ? st25r->recoverSectorKeys((uint8_t)sectorValue.toInt(), progress, nullptr,
                                                          /*stopAfterFirst=*/true)
                               : st25r->recoverAllKeys(progress, nullptr);
+    st25r->recoveryWatchStop();
 
     if (recovered == -2) {
         serialDevice->println("Recovery cancelled.");
     } else if (recovered == -3) {
         serialDevice->println("Recovery stopped: low memory.");
+    } else if (recovered == -5) {
+        serialDevice->println(
+            "Recovery stopped: stalled, no progress for 10s (state dump above)."
+        );
     } else if (recovered == -4) {
         serialDevice->println("Recovery stopped: card lost, unsupported, or auth failed.");
     } else if (recovered < 0) {
