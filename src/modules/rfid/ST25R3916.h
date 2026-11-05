@@ -92,6 +92,55 @@ public:
     // Nested key recovery for every sector whose keys are still unknown.
     int recoverAllKeys(mfc_recovery::Progress progress = nullptr, void *context = nullptr);
 
+    // --- Offline oracle support (see mfc_offline.h) ---
+    //
+    // A real MIFARE card stays silent when the reader's ar does not match
+    // suc64(nt). This clone sometimes answers a wrong-key authentication with a
+    // well-formed 36-bit frame. If that answer is deterministic for a fixed
+    // transmitted wire, one capture identifies the key in RAM and the 66,000
+    // card exchanges a sweep needs collapse into 66,000 predictions.
+    struct WireAnswer {
+        uint32_t nt = 0;   // plaintext nonce the attempt was made against
+        int err = 0;       // transceive step code
+        int attempt = 0;   // 1-based probe attempt that produced this answer
+        uint16_t bits = 0; // received bits (36 = a well-formed answer)
+        uint8_t raw[5] = {}; // 32 answer bits + 4 parity bits, as received
+    };
+    struct WireProbeStats {
+        int attempts = 0;
+        int reselectFail = 0;
+        int noNonce = 0;
+        int answers36 = 0;
+        int answers4 = 0;   // 4-bit NAK
+        int silence = 0;    // no answer at all
+        int otherBits = 0;  // answered, but not a full frame
+        uint16_t otherSeen[4] = {}; // the first few unexpected bit counts
+        int otherSeenCount = 0;
+    };
+
+    // Send a caller-supplied 16-byte wire (8 data bytes, then 8 parity bytes in
+    // bit0) after the plaintext nonce exchange, up to `attempts` times, and
+    // record the first `wanted` well-formed answers. The wire never depends on a
+    // candidate key.
+    //
+    // When `genKey` is non-null the wire is instead generated from the first
+    // nonce the probe sees: a valid reader frame under `genKey` with reader
+    // nonce `genNr`, i.e. exactly the frame shape a real sweep transmits. It is
+    // then held constant for the remaining attempts, and written back to `wire`
+    // so the caller knows which bytes were sent.
+    //
+    // Read-only: it authenticates and transmits, never writes.
+    int mfcWireProbe(uint8_t block, bool useKeyB, uint8_t wire[16], int attempts, int wanted,
+                     WireAnswer *answers, int maxAnswers, WireProbeStats *stats,
+                     const uint8_t genKey[6] = nullptr, uint32_t genNr = 0, uint32_t fwtMs = 20);
+
+    // Read-only sample for the offline oracle: the target block's plaintext
+    // nonce plus the same nonce encrypted under the target key (obtained over a
+    // session opened with a known key). No key is tested.
+    bool mfcOfflineSample(uint8_t knownBlock, const uint8_t knownKey[6], bool knownB,
+                          uint8_t targetBlock, bool targetB, uint32_t *uid32Out, uint32_t *ntOut,
+                          uint32_t *ntEncOut, uint8_t *parBitsOut);
+
     // Nested key recovery for one sector (both key types that are still
     // unknown). Returns the number of keys newly found, or a negative error
     // code shared with recoverAllKeys. When stopAfterFirst is true the sector

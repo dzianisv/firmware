@@ -238,4 +238,24 @@ EnumResult enumerate(const Sample &s, int model, uint8_t out[][6], int maxOut) {
     return ctx.result;
 }
 
+void buildReaderWire(
+    uint32_t nt, uint32_t uid, const uint8_t key[6], uint32_t nr, uint8_t wire[16]
+) {
+    Crypto1State c;
+    crypto1_init(&c, keyWord(key));
+    crypto1_word(&c, nt ^ uid, 0);
+    const uint32_t ar = prng_successor(nt, 64);
+    for (int i = 0; i < 4; i++) {
+        const uint8_t p = (uint8_t)(nr >> (24 - 8 * i));
+        wire[i] = (uint8_t)(crypto1_byte(&c, p, 0) ^ p);
+        wire[8 + i] = (uint8_t)(crypto1_filter_bit(&c) ^ nfc_oddparity(p));
+    }
+    for (int i = 0; i < 4; i++) {
+        const uint8_t p = (uint8_t)(ar >> (24 - 8 * i));
+        wire[4 + i] = (uint8_t)(crypto1_byte(&c, p, 0) ^ p);
+        wire[12 + i] = (uint8_t)(crypto1_filter_bit(&c) ^ nfc_oddparity(p));
+    }
+    for (int i = 0; i < 8; i++) wire[8 + i] &= 1u;
+}
+
 } // namespace mfc_offline

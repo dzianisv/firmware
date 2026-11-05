@@ -7,6 +7,7 @@
 #include "modules/rfid/RFID2.h"
 #include "modules/rfid/RFIDInterface.h"
 #include <globals.h>
+#include <esp_random.h>
 
 // Common workflows via serial:
 //   Read a tag:                    rfid read [timeout=5000]
@@ -674,6 +675,262 @@ uint32_t rfidMfcStaticCallback(cmd *c) {
     return res == ST25R3916::RecoveryResult::Verified;
 }
 
+// One capture line: the wire that was sent and what came back.
+static void _rfidPrintWireAnswer(const uint8_t wire[16], const ST25R3916::WireAnswer &a) {
+    char wireHex[33], rx[9], par[5], raw[11];
+    for (int i = 0; i < 8; i++) snprintf(wireHex + i * 2, 3, "%02X", wire[i]);
+    for (int i = 0; i < 8; i++) snprintf(wireHex + 16 + i * 2, 3, "%02X", wire[8 + i] & 1u);
+    for (int i = 0; i < 4; i++) snprintf(rx + i * 2, 3, "%02X", a.raw[i]);
+    for (int i = 0; i < 4; i++) par[i] = (char)('0' + ((a.raw[4] >> i) & 1u));
+    par[4] = 0;
+    for (int i = 0; i < 5; i++) snprintf(raw + i * 2, 3, "%02X", a.raw[i]);
+    serialDevice->println(
+        String("wire nt=") + String(a.nt, HEX) + " wire=" + wireHex + " rx=" + rx + " par=" + par +
+        " raw=" + raw + " bits=" + String(a.bits) + " err=" + String(a.err) +
+        " try=" + String(a.attempt)
+    );
+}
+
+// Parse exactly n bytes from 2n hex characters. Returns false on any non-hex.
+static bool _rfidParseHex(const String &hex, uint8_t *out, int n) {
+    if ((int)hex.length() != n * 2) return false;
+    auto nib = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+        if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+        return -1;
+    };
+    for (int i = 0; i < n; i++) {
+        const int hi = nib(hex.charAt(i * 2));
+        const int lo = nib(hex.charAt(i * 2 + 1));
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+// rfid mfcwire <block> <32-hex-wire> [attempts=200] [wanted=1] [A|B]
+//
+// Send a fixed 16-byte wire (8 data bytes, then 8 parity bytes) after the
+// plaintext nonce exchange and print what the card answers. The wire does not
+// depend on any key, so the same bytes go out on every attempt: that is what
+// makes a captured answer testable offline. Read-only.
+uint32_t rfidMfcWireCallback(cmd *c) {
+    Command cmd(c);
+    if (cmd.countArgs() < 2) {
+        serialDevice->println("Usage: rfid mfcwire <block> <32-hex-wire> [attempts] [wanted] [A|B]");
+        serialDevice->println("  wire = 8 data bytes then 8 parity bytes, transmitted verbatim");
+        return false;
+    }
+    const int block = cmd.getArgument(0).getValue().toInt();
+    String hex = cmd.getArgument(1).getValue();
+    hex.trim();
+    hex.replace(" ", "");
+    int attempts = cmd.countArgs() > 2 ? cmd.getArgument(2).getValue().toInt() : 200;
+    int wanted = cmd.countArgs() > 3 ? cmd.getArgument(3).getValue().toInt() : 1;
+    const bool useB =
+        cmd.countArgs() > 4 && cmd.getArgument(4).getValue().equalsIgnoreCase("B");
+
+    uint8_t wire[16];
+    if (block < 0 || block > 255 || !_rfidParseHex(hex, wire, 16)) {
+        serialDevice->println(
+            "ERROR: block 0-255 and 32 hex characters (8 data + 8 parity) are required"
+        );
+        return false;
+    }
+    if (attempts < 1) attempts = 1;
+    if (wanted < 1) wanted = 1;
+    if (wanted > 8) wanted = 8;
+
+    if (!_ensureRfid()) return false;
+    if (bruceConfigPins.rfidModule != ST25R3916_SPI_MODULE &&
+        bruceConfigPins.rfidModule != ST25R3916_I2C_MODULE) {
+        serialDevice->println("ERROR: the wire probe requires the ST25R3916 module");
+        return false;
+    }
+    ST25R3916 *st25r = static_cast<ST25R3916 *>(_rfid);
+    serialDevice->println("Place tag on reader...");
+    if (!st25r->selectMifareClassic(5000, true)) {
+        serialDevice->println("Read failed: tag not found");
+        return false;
+    }
+
+    ST25R3916::WireAnswer answers[8];
+    ST25R3916::WireProbeStats stats;
+    const uint32_t startedMs = millis();
+    const int captured =
+        st25r->mfcWireProbe((uint8_t)block, useB, wire, attempts, wanted, answers, 8, &stats);
+    const uint32_t elapsedMs = millis() - startedMs;
+
+    for (int i = 0; i < captured; i++) {
+        _rfidPrintWireAnswer(wire, answers[i]);
+    }
+    serialDevice->println(
+        String("wire summary tries=") + String(stats.attempts) + " hits=" + String(stats.answers36) +
+        " nonce=" + String(stats.attempts - stats.noNonce - stats.reselectFail) +
+        " noNonce=" + String(stats.noNonce) + " naks4=" + String(stats.answers4) +
+        " silence=" + String(stats.silence) + " other=" + String(stats.otherBits) +
+        " reselectFail=" + String(stats.reselectFail) + " ms=" + String(elapsedMs)
+    );
+    return captured > 0;
+}
+
+// rfid mfcscan <block> [wires=120] [tries=4] [A|B]
+//
+// Search for a wire the card answers. Each group transmits one reader-shaped
+// frame (nr random, ar = suc64(nt), parity consistent with a random key) and
+// repeats it `tries` times, so a group answers either never or every time when
+// the card's answer depends on the wire. That distinction is the whole
+// question: a wire that answers every time is a usable oracle, a wire that
+// answers at random is noise.
+//
+// Read-only.
+uint32_t rfidMfcScanCallback(cmd *c) {
+    Command cmd(c);
+    const int block = cmd.countArgs() > 0 ? cmd.getArgument(0).getValue().toInt() : 0;
+    int wires = cmd.countArgs() > 1 ? cmd.getArgument(1).getValue().toInt() : 120;
+    int tries = cmd.countArgs() > 2 ? cmd.getArgument(2).getValue().toInt() : 4;
+    const bool useB = cmd.countArgs() > 3 && cmd.getArgument(3).getValue().equalsIgnoreCase("B");
+
+    if (block < 0 || block > 255) {
+        serialDevice->println("ERROR: block 0-255 is required");
+        return false;
+    }
+    if (wires < 1) wires = 1;
+    if (wires > 400) wires = 400;
+    if (tries < 1) tries = 1;
+    if (tries > 8) tries = 8;
+
+    if (!_ensureRfid()) return false;
+    if (bruceConfigPins.rfidModule != ST25R3916_SPI_MODULE &&
+        bruceConfigPins.rfidModule != ST25R3916_I2C_MODULE) {
+        serialDevice->println("ERROR: the wire scan requires the ST25R3916 module");
+        return false;
+    }
+    ST25R3916 *st25r = static_cast<ST25R3916 *>(_rfid);
+    serialDevice->println("Place tag on reader...");
+    bool selected = false;
+    for (int attempt = 0; attempt < 3 && !selected; attempt++) {
+        if (attempt) delay(150);
+        selected = st25r->selectMifareClassic(5000, true);
+    }
+    if (!selected) {
+        serialDevice->println("Read failed: tag not found");
+        return false;
+    }
+
+    ST25R3916::WireProbeStats total;
+    int answeredWires = 0;
+    int unansweredWires = 0;
+    const uint32_t startedMs = millis();
+    serialDevice->println(
+        String("scan block=") + String(block) + " wires=" + String(wires) +
+        " tries=" + String(tries)
+    );
+    for (int w = 0; w < wires; w++) {
+        // A random key gives the frame the same shape a sweep sends: nr arbitrary,
+        // ar = suc64(nt), parity consistent with that key.
+        uint8_t key[6];
+        for (int i = 0; i < 6; i++) key[i] = (uint8_t)(esp_random() & 0xFF);
+        const uint32_t nr = esp_random();
+        uint8_t wire[16] = {0};
+        ST25R3916::WireAnswer answers[8];
+        ST25R3916::WireProbeStats stats;
+        // 2 ms frame wait: the same window the recovery sweep uses, so the probe
+        // sees the card under the conditions that produced the observed frames.
+        const int n = st25r->mfcWireProbe(
+            (uint8_t)block, useB, wire, tries, tries, answers, 8, &stats, key, nr, 2
+        );
+        total.attempts += stats.attempts;
+        total.reselectFail += stats.reselectFail;
+        total.noNonce += stats.noNonce;
+        total.answers36 += stats.answers36;
+        total.answers4 += stats.answers4;
+        total.silence += stats.silence;
+        total.otherBits += stats.otherBits;
+        if (n > 0) {
+            answeredWires++;
+            for (int i = 0; i < n; i++) _rfidPrintWireAnswer(wire, answers[i]);
+        } else {
+            unansweredWires++;
+        }
+    }
+    const uint32_t elapsedMs = millis() - startedMs;
+    serialDevice->println(
+        String("scan summary wires=") + String(wires) + " answered=" + String(answeredWires) +
+        " silent=" + String(unansweredWires) + " tries=" + String(total.attempts) +
+        " hits36=" + String(total.answers36) + " naks4=" + String(total.answers4) +
+        " noAnswer=" + String(total.silence) + " other=" + String(total.otherBits) +
+        " noNonce=" + String(total.noNonce) + " reselectFail=" + String(total.reselectFail) +
+        " ms=" + String(elapsedMs)
+    );
+    return answeredWires > 0;
+}
+
+// rfid mfcsample <knownBlock> <A|B> <12-hex-key> <targetBlock> <A|B>
+//
+// Capture what the offline oracle needs about the target block: its plaintext
+// nonce and the same nonce encrypted under the target key. No key is tested and
+// nothing is written.
+uint32_t rfidMfcSampleCallback(cmd *c) {
+    Command cmd(c);
+    if (cmd.countArgs() < 5) {
+        serialDevice->println(
+            "Usage: rfid mfcsample <knownBlock> <A|B> <12-hex-key> <targetBlock> <A|B>"
+        );
+        return false;
+    }
+    const int knownBlock = cmd.getArgument(0).getValue().toInt();
+    const bool knownB = cmd.getArgument(1).getValue().equalsIgnoreCase("B");
+    String hex = cmd.getArgument(2).getValue();
+    hex.trim();
+    hex.replace(" ", "");
+    const int targetBlock = cmd.getArgument(3).getValue().toInt();
+    const bool targetB = cmd.getArgument(4).getValue().equalsIgnoreCase("B");
+
+    uint8_t key[6];
+    if (knownBlock < 0 || knownBlock > 255 || targetBlock < 0 || targetBlock > 255 ||
+        !_rfidParseHex(hex, key, 6)) {
+        serialDevice->println("ERROR: blocks 0-255 and a 12-hex-character key are required");
+        return false;
+    }
+    if (!_ensureRfid()) return false;
+    if (bruceConfigPins.rfidModule != ST25R3916_SPI_MODULE &&
+        bruceConfigPins.rfidModule != ST25R3916_I2C_MODULE) {
+        serialDevice->println("ERROR: the sample capture requires the ST25R3916 module");
+        return false;
+    }
+    ST25R3916 *st25r = static_cast<ST25R3916 *>(_rfid);
+    serialDevice->println("Place tag on reader...");
+    if (!st25r->selectMifareClassic(5000, true)) {
+        serialDevice->println("Read failed: tag not found");
+        return false;
+    }
+    uint32_t uid32 = 0, nt = 0, enc = 0;
+    uint8_t parBits = 0;
+    const bool ok = st25r->mfcOfflineSample(
+        (uint8_t)knownBlock, key, knownB, (uint8_t)targetBlock, targetB, &uid32, &nt, &enc, &parBits
+    );
+    if (!ok) {
+        serialDevice->println("sample failed: no nonce/keystream capture");
+        return false;
+    }
+    char line[96];
+    snprintf(
+        line,
+        sizeof(line),
+        "sample uid=%08lX nt=%08lX enc=%08lX par=%u target=%d/%c",
+        (unsigned long)uid32,
+        (unsigned long)nt,
+        (unsigned long)enc,
+        parBits,
+        targetBlock,
+        targetB ? 'B' : 'A'
+    );
+    serialDevice->println(line);
+    return true;
+}
+
 // rfid mfcaddkey <12-hex-key>
 // Register a key recovered elsewhere so a later `rfid read` can open the
 // sector it belongs to. Touches no card.
@@ -837,6 +1094,26 @@ void createRfidCommands(SimpleCLI *cli) {
     mfcStaticCmd.addPosArg("knownKeyType", "A");    mfcStaticCmd.addPosArg("knownKey", "A0A1A2A3A4A5");
     mfcStaticCmd.addPosArg("targetBlock", "7");
     mfcStaticCmd.addPosArg("targetKeyType", "A");
+
+    Command mfcWireCmd = cmd.addCommand("mfcwire", rfidMfcWireCallback);
+    mfcWireCmd.addPosArg("block", "0");
+    mfcWireCmd.addPosArg("wire", "");
+    mfcWireCmd.addPosArg("attempts", "200");
+    mfcWireCmd.addPosArg("wanted", "1");
+    mfcWireCmd.addPosArg("keyType", "A");
+
+    Command mfcSampleCmd = cmd.addCommand("mfcsample", rfidMfcSampleCallback);
+    mfcSampleCmd.addPosArg("knownBlock", "0");
+    mfcSampleCmd.addPosArg("knownKeyType", "A");
+    mfcSampleCmd.addPosArg("knownKey", "A0A1A2A3A4A5");
+    mfcSampleCmd.addPosArg("targetBlock", "4");
+    mfcSampleCmd.addPosArg("targetKeyType", "A");
+
+    Command mfcScanCmd = cmd.addCommand("mfcscan", rfidMfcScanCallback);
+    mfcScanCmd.addPosArg("block", "0");
+    mfcScanCmd.addPosArg("wires", "120");
+    mfcScanCmd.addPosArg("tries", "4");
+    mfcScanCmd.addPosArg("keyType", "A");
 
     Command mfcDiagCmd = cmd.addCommand("mfcdiag", rfidMfcDiagCallback);
     mfcDiagCmd.addPosArg("key", "");

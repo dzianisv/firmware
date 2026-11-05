@@ -6,6 +6,7 @@
 #include "mfc_recovery.h"
 #include "mfc_flipper.h"
 #include "mfc_nested.h"
+#include "mfc_offline.h"
 
 // ST25R3916 via RFAL fork (lewisxhe/ST25R3916-fork + NFC-RFAL-fork).
 // Supported: SPI mode on boards with ST25R wiring such as lilygo-t-lora-pager and reaper.
@@ -3806,6 +3807,162 @@ bool ST25R3916::_mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB, u
         return false;
     }
     _mfcAuthed = true;
+    return true;
+}
+
+// Read-only probe of the clone's wrong-key answer.
+//
+// A real MIFARE card goes silent when the reader's ar does not match suc64(nt).
+// This clone sometimes answers with a well-formed 36-bit frame. The wire is
+// caller-supplied and constant, so the transmitted bytes never depend on a
+// candidate key: that is what makes the answer testable offline.
+//
+// Nothing is written to the card. Every attempt is a fresh anticollision, the
+// plaintext nonce exchange, then the wire.
+int ST25R3916::mfcWireProbe(
+    uint8_t block, bool useKeyB, uint8_t wire[16], int attempts, int wanted, WireAnswer *answers,
+    int maxAnswers, WireProbeStats *stats, const uint8_t genKey[6], uint32_t genNr, uint32_t fwtMs
+) {
+    if (!_nfc || !_hw || !stats || !wire) return -1;
+    *stats = WireProbeStats{};
+    if (attempts < 1) attempts = 1;
+    if (attempts > 2000) attempts = 2000;
+    if (wanted < 1) wanted = 1;
+    if (!answers) maxAnswers = 0;
+    int captured = 0;
+    bool wireReady = (genKey == nullptr); // a fixed wire is ready before the first nonce
+
+    uint8_t cmd[2] = {(uint8_t)(useKeyB ? 0x61 : 0x60), block};
+    const uint16_t crc = _hw->rfalCrcCalculateCcitt(0x6363, cmd, 2);
+    uint8_t auth1[4] = {cmd[0], cmd[1], (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8)};
+
+    for (int i = 0; i < attempts && captured < wanted; i++) {
+        stats->attempts++;
+        _mfcAuthed = false;
+        if (!mfcReselect(5000)) {
+            stats->reselectFail++;
+            continue;
+        }
+        // Two frames of per-frame detail, then quiet: the hit rate is counted,
+        // not printed, so 200 attempts do not flood the log.
+        _mfcXcvVerbose = (i < 2);
+
+        uint8_t rx[8] = {0};
+        uint16_t rxBits = 0;
+        auto err = _mifareTransceiveRaw(
+            auth1,
+            (uint16_t)rfalConvBytesToBits(4),
+            rx,
+            sizeof(rx),
+            &rxBits,
+            rfalConvMsTo1fc(20),
+            MFC_FLAGS_FIRSTAUTH,
+            "wire-auth1"
+        );
+        if (!_mfcRxOk(err) || rxBits != 36) {
+            stats->noNonce++;
+            continue;
+        }
+        uint8_t ntBuf[4] = {0};
+        _mfcUnpackBits(rx, rxBits, ntBuf, 4);
+        const uint32_t nt = ((uint32_t)ntBuf[0] << 24) | ((uint32_t)ntBuf[1] << 16) |
+                            ((uint32_t)ntBuf[2] << 8) | (uint32_t)ntBuf[3];
+
+        // A generated wire is fixed once per call: the point of the probe is a
+        // transmitted string that never varies between attempts.
+        if (!wireReady) {
+            mfc_offline::buildReaderWire(nt, _mfcUid32(), genKey, genNr, wire);
+            wireReady = true;
+        }
+
+        // 8 data bytes with 8 parity bits: 72 bits, the same frame shape the
+        // recovery loop sends for every candidate.
+        uint8_t tx[16] = {0};
+        const uint16_t txBits = _mfcPackBits(wire, wire + 8, 8, tx);
+        memset(rx, 0, sizeof(rx));
+        rxBits = 0;
+        _mfcPhase(MFC_PH_AT);
+        err = _mifareTransceiveRaw(
+            tx,
+            txBits,
+            rx,
+            sizeof(rx),
+            &rxBits,
+            rfalConvMsTo1fc(fwtMs),
+            MFC_FLAGS_ENC,
+            "wire"
+        );
+
+        if (_mfcRxOk(err) && rxBits == 36) {
+            stats->answers36++;
+            if (captured < maxAnswers) {
+                WireAnswer &a = answers[captured];
+                a.nt = nt;
+                a.err = (int)err;
+                a.attempt = i + 1;
+                a.bits = rxBits;
+                memcpy(a.raw, rx, 5); // 32 data bits + 4 parity bits
+                captured++;
+            }
+        } else if (_mfcRxOk(err) && rxBits == 4) {
+            stats->answers4++;
+        } else if (rxBits == 0) {
+            stats->silence++;
+        } else {
+            stats->otherBits++;
+            if (stats->otherSeenCount < 4) stats->otherSeen[stats->otherSeenCount++] = rxBits;
+            if (_mfcXcvVerbose)
+                ST25R_LOG("wire: unexpected answer bits=%u err=%d", rxBits, (int)err);
+        }
+    }
+    _mfcXcvVerbose = true;
+    _mfcHalt();
+    _mfcAuthed = false;
+    return captured;
+}
+
+// Read-only capture of everything the offline oracle needs about one block:
+// its plaintext nonce and the same nonce encrypted under its (unknown) key. The
+// encrypted nonce comes from a nested authentication bootstrapped with a known
+// key, which is the existing proven path. No key is tested here.
+bool ST25R3916::mfcOfflineSample(
+    uint8_t knownBlock, const uint8_t knownKey[6], bool knownB, uint8_t targetBlock, bool targetB,
+    uint32_t *uid32Out, uint32_t *ntOut, uint32_t *ntEncOut, uint8_t *parBitsOut
+) {
+    if (!_nfc || !_hw || !knownKey || !uid32Out || !ntOut || !ntEncOut || !parBitsOut) return false;
+    *ntOut = 0;
+    *ntEncOut = 0;
+    *parBitsOut = 0;
+    *uid32Out = _mfcUid32();
+
+    // 1. Plain nonce of the target block: the card sends it before it checks any
+    //    key, so this needs no key at all.
+    if (!mfcReselect(5000)) return false;
+    uint32_t nt = 0;
+    const bool gotNt = _mfcCaptureNonceRaw(targetBlock, nullptr, targetB, &nt);
+    _mfcHalt();
+    _mfcAuthed = false;
+    if (!gotNt) return false;
+
+    // 2. The same nonce encrypted under the target key, over a session opened
+    //    with the known key.
+    if (!mfcReselect(5000)) return false;
+    if (!_mifareAuth(knownBlock, knownKey, knownB)) {
+        _mfcHalt();
+        _mfcAuthed = false;
+        return false;
+    }
+    uint32_t enc = 0;
+    uint8_t par[3] = {0, 0, 0};
+    const bool gotEnc = _mfcNestedAuthCapture(targetBlock, targetB, &enc, par);
+    _mfcHalt();
+    _mfcAuthed = false;
+    if (!gotEnc) return false;
+
+    *uid32Out = _mfcUid32();
+    *ntOut = nt;
+    *ntEncOut = enc;
+    *parBitsOut = (uint8_t)((par[0] & 1u) | ((par[1] & 1u) << 1) | ((par[2] & 1u) << 2));
     return true;
 }
 

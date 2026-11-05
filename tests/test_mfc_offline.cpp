@@ -155,6 +155,36 @@ int main() {
         }
     }
 
+    // buildReaderWire must produce a frame a card holding that key accepts: the
+    // decrypted ar equals suc64(nt) and the decrypted nr is the reader's nr.
+    {
+        uint8_t k2[6];
+        fillRandomKey(rng, k2);
+        const uint32_t nr0 = rng();
+        uint8_t w[16];
+        mfc_offline::buildReaderWire(nt, uid, k2, nr0, w);
+
+        Crypto1State c;
+        crypto1_init(&c, keyWord(k2));
+        crypto1_word(&c, nt ^ uid, 0);
+        uint8_t dec[8], decPar[8];
+        for (int i = 0; i < 8; i++) {
+            dec[i] = (uint8_t)(crypto1_byte(&c, w[i], 1) ^ w[i]);
+            decPar[i] = (uint8_t)(crypto1_filter_bit(&c) ^ nfc_oddparity(dec[i]));
+        }
+        uint32_t nrBack = 0, arBack = 0;
+        for (int i = 0; i < 4; i++) {
+            nrBack = (nrBack << 8) | dec[i];
+            arBack = (arBack << 8) | dec[4 + i];
+        }
+        CHECK(nrBack == nr0, "buildReaderWire: nr %08X != %08X", nrBack, nr0);
+        CHECK(arBack == prng_successor(nt, 64), "buildReaderWire: ar %08X != suc64(nt)", arBack);
+        for (int i = 0; i < 8; i++) {
+            CHECK((w[8 + i] & 1u) == (decPar[i] & 1u), "buildReaderWire: parity %d wrong", i);
+        }
+        printf("buildReaderWire: nr/ar/parity round-trip ok\n");
+    }
+
     // feedSearch must recover the clock count that produced a nr+ar capture.
     {
         const mfc_offline::Sample s =

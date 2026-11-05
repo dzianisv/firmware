@@ -86,6 +86,16 @@ int zeroFeedSearch(
     const Sample &s, const uint8_t key[6], int maxBits, int *outBits, int maxOut
 );
 
+// Build the 16-byte wire a reader holding `key` would transmit for nonce `nt`:
+// nr = `nr`, ar = suc64(nt), encrypted with matching parity.
+// wire[0..7] = data, wire[8..15] = parity bits in bit0 of each byte.
+//
+// This is what the recovery loop already sends for every candidate, so a probe
+// frame built here has exactly the shape the card sees in a real sweep.
+void buildReaderWire(
+    uint32_t nt, uint32_t uid, const uint8_t key[6], uint32_t nr, uint8_t wire[16]
+);
+
 struct EnumResult {
     int candidates = 0; // keys the keystream solver offered
     int survivors = 0;  // of those, keys that also predict the captured answer
