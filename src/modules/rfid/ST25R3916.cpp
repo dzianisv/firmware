@@ -101,6 +101,7 @@ static void _mfcWatchStop() {
 }
 
 static void _mfcStallDump(const char *what, uint32_t age) {
+    if (Serial.availableForWrite() < 160) return; // never block on a wedged CDC
     const uint8_t phase = gMfcPhase;
     Serial.printf(
         "[MFC] %s: no progress for %lums phase=%s band=%d bucket=%d tried=%lu heap=%lu\n",
@@ -119,6 +120,7 @@ static void _mfcStallDump(const char *what, uint32_t age) {
 // other phase that stays put for 10 s is a stall.
 static void _mfcMonitorTask(void *) {
     bool dumped = false;
+    uint32_t lastBeatLine = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(500));
         const uint32_t beat = gMfcBeatAt;
@@ -127,6 +129,12 @@ static void _mfcMonitorTask(void *) {
             continue;
         }
         const uint32_t age = millis() - beat;
+        // One line every 30 s from a task that never touches the card: proof of
+        // life that does not depend on a candidate being offered.
+        if (millis() - lastBeatLine >= 30000u) {
+            lastBeatLine = millis();
+            _mfcStallDump("beat", age);
+        }
         const uint32_t limit = (gMfcPhase == MFC_PH_SOLVE) ? 30000u : 10000u;
         if (age < limit) continue;
         if (!dumped) {
@@ -137,7 +145,8 @@ static void _mfcMonitorTask(void *) {
         if (!gMfcAbort) {
             gMfcAbort = true;
             _mfcStallDump("STALL", age);
-            Serial.println("[MFC] STALL: aborting enumeration");
+            if (Serial.availableForWrite() >= 48)
+                Serial.println("[MFC] STALL: aborting enumeration");
         }
     }
 }
@@ -155,6 +164,7 @@ static void _mfcBandReport(const mfc_flipper::BandReport &report, void *) {
     gMfcTried = report.candidates;
     if (!report.finished) _mfcPhase(MFC_PH_SOLVE); // long, quiet, legitimate
     _mfcBeat();
+    if (Serial.availableForWrite() < 128) return; // never block on a wedged CDC
     Serial.printf(
         "[MFC] flip band=%u %s cand=%u bucket_max=%u overflow=%d heap=%lu\n",
         report.band,
@@ -187,13 +197,26 @@ static void st25rLogToScreen(const char *msg) {
 #endif
 
 #define ST25R_DEBUG 1
+// A USB CDC port that the host stops draining blocks Serial.printf forever.
+// Observed 2026-11-04: output stops mid-sweep, no panic, no reboot, and the
+// blocked print inside the sweep is indistinguishable from a hang. Every log
+// line therefore checks for room first and is dropped instead of blocking the
+// recovery. `availableForWrite()` on the Arduino CDC returns free ring space.
+static inline bool _st25rLogReady() { return Serial.availableForWrite() >= 96; }
+
 #if ST25R_DEBUG
-#define ST25R_LOG(fmt, ...) Serial.printf("[ST25R] " fmt "\n", ##__VA_ARGS__)
+#define ST25R_LOG(fmt, ...)                                  \
+    do {                                                     \
+        if (_st25rLogReady()) Serial.printf("[ST25R] " fmt "\n", ##__VA_ARGS__); \
+    } while (0)
 #else
 #define ST25R_LOG(fmt, ...) do { } while (0)
 #endif
 // High-level recovery evidence stays visible without the driver debug flood.
-#define ST25R_RECOVERY_LOG(fmt, ...) Serial.printf("[MFC] " fmt "\n", ##__VA_ARGS__)
+#define ST25R_RECOVERY_LOG(fmt, ...)                         \
+    do {                                                     \
+        if (_st25rLogReady()) Serial.printf("[MFC] " fmt "\n", ##__VA_ARGS__);   \
+    } while (0)
 
 #if defined(HAS_SCREEN)
 #define ST25R_LOG_SCREEN(fmt, ...) do {                    \
@@ -3690,7 +3713,8 @@ bool ST25R3916::_mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB, u
             "auth1"
         );
         if (!_mfcRxOk(err) || rxBits != 36) {
-            ST25R_LOG("mfc auth1 blk=%u no nonce err=%d bits=%u", block, (int)err, rxBits);
+            if (_mfcXcvVerbose)
+                ST25R_LOG("mfc auth1 blk=%u no nonce err=%d bits=%u", block, (int)err, rxBits);
             return false;
         }
         uint8_t ntBuf[4] = {0};
@@ -3758,7 +3782,8 @@ bool ST25R3916::_mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB, u
     // Measured AT: 36 bits on success (32 data + 4 parity), 4 bits on NAK.
     // Keep a range because both are valid card responses; timeouts/framing fail _mfcRxOk.
     if (!_mfcRxOk(err) || (rxBits != 36 && rxBits != 4)) {
-        ST25R_LOG("mfc auth blk=%u no AT err=%d bits=%u", block, (int)err, rxBits);
+        if (_mfcXcvVerbose)
+            ST25R_LOG("mfc auth blk=%u no AT err=%d bits=%u", block, (int)err, rxBits);
         _mfcAuthed = false;
         return false;
     }
