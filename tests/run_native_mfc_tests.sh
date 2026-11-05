@@ -32,3 +32,14 @@ g++ -std=c++17 -O2 -Wall -pthread -DMFC_FLIPPER_TESTING -I"$SRC" \
     "$SRC/mfc_recovery.cpp" \
     -o "$OUT/test_mfc_flipper"
 "$OUT/test_mfc_flipper"
+
+# Offline oracle (mfc_offline): one captured wrong-key frame must identify the
+# key in RAM, with no card exchange per candidate.
+g++ -std=c++17 -O2 -Wall -pthread -I"$SRC" \
+    tests/test_mfc_offline.cpp \
+    "$SRC/crypto1.cpp" \
+    "$SRC/mfc_flipper.cpp" \
+    "$SRC/mfc_offline.cpp" \
+    "$SRC/mfc_recovery.cpp" \
+    -o "$OUT/test_mfc_offline"
+"$OUT/test_mfc_offline"
