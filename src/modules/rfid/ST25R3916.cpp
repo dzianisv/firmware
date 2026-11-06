@@ -3906,6 +3906,18 @@ int ST25R3916::mfcWireProbe(
             }
         } else if (_mfcRxOk(err) && rxBits == 4) {
             stats->answers4++;
+            // A wrong key only ever gets a 4-bit answer from this clone. Capture
+            // it: a NAK-based offline filter has to predict this nibble, so the
+            // first question is whether it varies at all when the wire changes.
+            if (captured < maxAnswers) {
+                WireAnswer &a = answers[captured];
+                a.nt = nt;
+                a.err = (int)err;
+                a.attempt = i + 1;
+                a.bits = rxBits;
+                memcpy(a.raw, rx, 5);
+                captured++;
+            }
         } else if (rxBits == 0) {
             stats->silence++;
         } else {
