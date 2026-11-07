@@ -709,6 +709,39 @@ static bool _rfidParseHex(const String &hex, uint8_t *out, int n) {
     return true;
 }
 
+// rfid mfcbench [okBlock=12] [nakBlock=12]
+//
+// Where does the ~12 ms per MIFARE frame go? Measures the pieces the recovery
+// loop pays for and prints microseconds per operation. Read-only: it
+// authenticates with a known key and with a deliberately wrong one, never
+// writes. The no-answer test at two timeouts separates reader overhead from
+// card latency: both cost fwt + C means C is ours, both cost fwt means the
+// card is the slow part.
+uint32_t rfidMfcBenchCallback(cmd *c) {
+    Command cmd(c);
+    const int okBlock = cmd.countArgs() > 0 ? cmd.getArgument(0).getValue().toInt() : 12;
+    const int nakBlock = cmd.countArgs() > 1 ? cmd.getArgument(1).getValue().toInt() : 12;
+    if (okBlock < 0 || okBlock > 255 || nakBlock < 0 || nakBlock > 255) {
+        serialDevice->println("ERROR: block 0-255");
+        return false;
+    }
+    if (!_ensureRfid()) return false;
+    if (bruceConfigPins.rfidModule != ST25R3916_SPI_MODULE &&
+        bruceConfigPins.rfidModule != ST25R3916_I2C_MODULE) {
+        serialDevice->println("ERROR: the bench requires the ST25R3916 module");
+        return false;
+    }
+    ST25R3916 *st25r = static_cast<ST25R3916 *>(_rfid);
+    serialDevice->println("Place tag on reader...");
+    if (!st25r->selectMifareClassic(5000, true)) {
+        serialDevice->println("Read failed: tag not found");
+        return false;
+    }
+    st25r->mfcBench((uint8_t)okBlock, (uint8_t)nakBlock);
+    serialDevice->println("bench done");
+    return true;
+}
+
 // rfid mfcwire <block> <32-hex-wire> [attempts=200] [wanted=1] [A|B]
 //
 // Send a fixed 16-byte wire (8 data bytes, then 8 parity bytes) after the
@@ -1094,6 +1127,10 @@ void createRfidCommands(SimpleCLI *cli) {
     mfcStaticCmd.addPosArg("knownKeyType", "A");    mfcStaticCmd.addPosArg("knownKey", "A0A1A2A3A4A5");
     mfcStaticCmd.addPosArg("targetBlock", "7");
     mfcStaticCmd.addPosArg("targetKeyType", "A");
+
+    Command mfcBenchCmd = cmd.addCommand("mfcbench", rfidMfcBenchCallback);
+    mfcBenchCmd.addPosArg("okBlock", "12");
+    mfcBenchCmd.addPosArg("nakBlock", "12");
 
     Command mfcWireCmd = cmd.addCommand("mfcwire", rfidMfcWireCallback);
     mfcWireCmd.addPosArg("block", "0");

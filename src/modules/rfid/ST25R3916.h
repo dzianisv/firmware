@@ -134,6 +134,12 @@ public:
                      WireAnswer *answers, int maxAnswers, WireProbeStats *stats,
                      const uint8_t genKey[6] = nullptr, uint32_t genNr = 0, uint32_t fwtMs = 20);
 
+    // Read-only timing breakdown of the recovery loop: polled register read,
+    // a frame the card ignores at two timeouts (separates reader overhead from
+    // card latency), WUPA, select, a known-key auth and a wrong-key candidate,
+    // with and without re-selecting between attempts.
+    void mfcBench(uint8_t okBlock, uint8_t nakBlock);
+
     // Read-only sample for the offline oracle: the target block's plaintext
     // nonce plus the same nonce encrypted under the target key (obtained over a
     // session opened with a known key). No key is tested.
@@ -295,6 +301,11 @@ private:
                            uint8_t parBits, uint8_t *nackOut);
     uint32_t _mfcLastNt = 0;
     uint32_t _mfcLastDist = 0;
+    // What the last auth attempt actually got back: 36 = answer, 4 = NAK,
+    // 0 = silence. -1 until the first attempt. Lets a caller count NAKs
+    // without re-parsing a frame.
+    int _mfcLastAuthBits = -1;
+    int _mfcLastAuthErr = -1;
     int _writeMifareClassic(rfalNfcDevice *dev);       // authenticated write of loaded dump
     int _writeMifareClassicMagic(rfalNfcDevice *dev);  // clone to Magic Gen1
     void _mfcRebuildStrAllPages();

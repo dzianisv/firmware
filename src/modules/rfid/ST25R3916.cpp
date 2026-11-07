@@ -3688,7 +3688,242 @@ static uint8_t _mfcUnpackParity(const uint8_t *in, uint16_t nbits, uint8_t *outP
     return err;
 }
 
+// Read-only timing breakdown for the recovery loop; see mfcBench's declaration.
+// Every number is microseconds per operation, measured on the running device.
+void ST25R3916::mfcBench(uint8_t okBlock, uint8_t nakBlock) {
+    if (!_nfc || !_hw) {
+        Serial.println("[BENCH] no hw");
+        return;
+    }
+    const bool wasVerbose = _mfcXcvVerbose;
+    _mfcXcvVerbose = false;
+
+    // Prime exactly the way the sweep does: a full reselect (halt, drop the
+    // field, rediscover), then the fast select the sink uses. Hand-rolling the
+    // poller init instead leaves the card unresponsive - measured: WUPA fails
+    // with step=2 and every later frame returns ST_ERR_WRONG_STATE.
+    const bool reselected = mfcReselect(5000);
+    _mfcFastReady = false;
+    const bool primed = _mfcFastSelect();
+    Serial.printf(
+        "[BENCH] prime reselect=%d sel=%d step=%u\n", reselected ? 1 : 0, primed ? 1 : 0,
+        _mfcFastSelectStep
+    );
+    if (!primed) {
+        _mfcXcvVerbose = wasVerbose;
+        return;
+    }
+    _mfcHalt();
+    delay(2);
+
+    const uint8_t okKey[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    const uint8_t badKey[6] = {0, 0, 0, 0, 0, 0};
+
+    // 1. One polled interrupt-register read. This is what every wait-loop
+    // iteration costs, because the bus has no IRQ line.
+    {
+        const int n = 200;
+        int ok = 0;
+        uint8_t v = 0;
+        const uint32_t t0 = micros();
+        for (int i = 0; i < n; i++) {
+            if (_hw->st25r3916ReadRegister(ST25R3916_REG_IC_IDENTITY, &v) == ST_ERR_NONE) ok++;
+        }
+        const uint32_t dt = micros() - t0;
+        Serial.printf(
+            "[BENCH] poll_read n=%d ok=%d us=%lu id=%02X\n", n, ok,
+            (unsigned long)(dt / (uint32_t)n), v
+        );
+    }
+
+    // 2. A frame the card ignores (it is HALTed) at two timeouts. Reader
+    // overhead is the part that survives both; card latency is the difference.
+    _mfcHalt();
+    for (int k = 0; k < 2; k++) {
+        const uint32_t fwtMs = (k == 0) ? 3 : 10;
+        uint8_t acmd[2] = {0x60, nakBlock};
+        const uint16_t crc = _hw->rfalCrcCalculateCcitt(0x6363, acmd, 2);
+        uint8_t tx[4] = {acmd[0], acmd[1], (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8)};
+        uint8_t rx[8] = {0};
+        uint16_t bits = 0;
+        const uint32_t t0 = micros();
+        auto err = _mifareTransceiveRaw(
+            tx, (uint16_t)rfalConvBytesToBits(4), rx, sizeof(rx), &bits, rfalConvMsTo1fc(fwtMs),
+            MFC_FLAGS_FIRSTAUTH, "bench-silent"
+        );
+        const uint32_t dt = micros() - t0;
+        Serial.printf(
+            "[BENCH] silent fwt=%lums err=%d bits=%u us=%lu\n", (unsigned long)fwtMs, (int)err,
+            bits, (unsigned long)dt
+        );
+    }
+
+    // 2b. The same silent frame with every rfalWorker() call timed. One huge
+    // call is chip setup; many small calls are the wait for the card.
+    {
+        uint8_t acmd[2] = {0x60, nakBlock};
+        const uint16_t crc = _hw->rfalCrcCalculateCcitt(0x6363, acmd, 2);
+        uint8_t tx[4] = {acmd[0], acmd[1], (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8)};
+        uint8_t rx[8] = {0};
+        uint16_t bits = 0;
+        rfalTransceiveContext ctx;
+        ctx.txBuf = tx;
+        ctx.txBufLen = (uint16_t)rfalConvBytesToBits(4);
+        ctx.rxBuf = rx;
+        ctx.rxBufLen = (uint16_t)rfalConvBytesToBits(sizeof(rx));
+        ctx.rxRcvdLen = &bits;
+        ctx.flags = MFC_FLAGS_FIRSTAUTH;
+        ctx.fwt = rfalConvMsTo1fc(3);
+        const uint32_t t0 = micros();
+        const auto startErr = _hw->rfalStartTransceive(&ctx);
+        const uint32_t tStart = micros() - t0;
+        uint32_t first = 0, worst = 0, sum = 0;
+        int calls = 0;
+        auto st = startErr;
+        if (startErr == ST_ERR_NONE) {
+            const uint32_t guard = micros();
+            for (;;) {
+                const uint32_t w0 = micros();
+                _hw->rfalWorker();
+                const uint32_t w = micros() - w0;
+                if (calls == 0) first = w;
+                if (w > worst) worst = w;
+                sum += w;
+                calls++;
+                st = _hw->rfalGetTransceiveStatus();
+                if (st != ST_ERR_BUSY) break;
+                if (micros() - guard > 30000) break;
+            }
+        }
+        Serial.printf(
+            "[BENCH] profile start=%lu calls=%d first=%lu worst=%lu sum=%lu total=%lu err=%d "
+            "bits=%u\n",
+            (unsigned long)tStart, calls, (unsigned long)first, (unsigned long)worst,
+            (unsigned long)sum, (unsigned long)(micros() - t0), (int)st, bits
+        );
+        _mfcHalt();
+        delay(2);
+        if (!_mfcFastSelect()) Serial.println("[BENCH] reselect after profile failed");
+    }
+
+    // 3. WUPA alone: one short frame the card answers with ATQA.
+    {
+        const int n = 10;
+        int ok = 0;
+        uint32_t acc = 0;
+        for (int i = 0; i < n; i++) {
+            _mfcHalt();
+            delay(2);
+            rfalNfcaSensRes sens;
+            const uint32_t t0 = micros();
+            if (_nfc->rfalNfcaPollerCheckPresence(RFAL_14443A_SHORTFRAME_CMD_WUPA, &sens) ==
+                ST_ERR_NONE)
+                ok++;
+            acc += micros() - t0;
+        }
+        Serial.printf("[BENCH] wupa n=%d ok=%d us=%lu\n", n, ok, (unsigned long)(acc / (uint32_t)n));
+    }
+
+    // 4. WUPA + SELECT: the two frames every candidate pays before its auth.
+    {
+        const int n = 10;
+        int ok = 0;
+        uint32_t acc = 0;
+        for (int i = 0; i < n; i++) {
+            _mfcHalt();
+            delay(2);
+            const uint32_t t0 = micros();
+            if (_mfcFastSelect()) ok++;
+            acc += micros() - t0;
+        }
+        Serial.printf(
+            "[BENCH] select n=%d ok=%d us=%lu\n", n, ok, (unsigned long)(acc / (uint32_t)n)
+        );
+    }
+
+    // 5. select + auth with a known key: the shape of a hit.
+    {
+        const int n = 10;
+        int ok = 0;
+        uint32_t selAcc = 0, authAcc = 0;
+        for (int i = 0; i < n; i++) {
+            _mfcHalt();
+            delay(2);
+            const uint32_t t0 = micros();
+            const bool sel = _mfcFastSelect();
+            const uint32_t t1 = micros();
+            const bool auth = sel && _mifareAuth(okBlock, okKey, false);
+            const uint32_t t2 = micros();
+            if (auth) {
+                ok++;
+                _mfcHalt();
+            }
+            selAcc += t1 - t0;
+            authAcc += t2 - t1;
+        }
+        Serial.printf(
+            "[BENCH] auth_ok n=%d ok=%d select_us=%lu auth_us=%lu\n", n, ok,
+            (unsigned long)(selAcc / (uint32_t)n), (unsigned long)(authAcc / (uint32_t)n)
+        );
+    }
+
+    // 6. select + auth with a wrong key: exactly what the sweep pays per
+    // candidate today.
+    {
+        const int n = 10;
+        int nak = 0, silent = 0;
+        uint32_t selAcc = 0, authAcc = 0;
+        for (int i = 0; i < n; i++) {
+            _mfcHalt();
+            delay(2);
+            const uint32_t t0 = micros();
+            const bool sel = _mfcFastSelect();
+            const uint32_t t1 = micros();
+            _mifareAuth(nakBlock, badKey, false);
+            const uint32_t t2 = micros();
+            selAcc += t1 - t0;
+            authAcc += t2 - t1;
+            if (_mfcLastAuthBits == 4) nak++;
+            else if (_mfcLastAuthBits == 0) silent++;
+        }
+        Serial.printf(
+            "[BENCH] candidate n=%d nak=%d silent=%d select_us=%lu auth_us=%lu total_us=%lu\n", n,
+            nak, silent, (unsigned long)(selAcc / (uint32_t)n),
+            (unsigned long)(authAcc / (uint32_t)n),
+            (unsigned long)((selAcc + authAcc) / (uint32_t)n)
+        );
+    }
+
+    // 7. The same without re-selecting: is the card still ACTIVE after a NAK?
+    // If it answers, a candidate costs one auth instead of select + auth.
+    {
+        const int n = 30;
+        int nak = 0, silent = 0, other = 0;
+        _mfcHalt();
+        delay(2);
+        const bool sel = _mfcFastSelect();
+        const uint32_t t0 = micros();
+        for (int i = 0; i < n; i++) {
+            _mifareAuth(nakBlock, badKey, false);
+            if (_mfcLastAuthBits == 4) nak++;
+            else if (_mfcLastAuthBits == 0) silent++;
+            else other++;
+        }
+        const uint32_t dt = micros() - t0;
+        Serial.printf(
+            "[BENCH] candidate_nosel sel=%d n=%d nak=%d silent=%d other=%d us=%lu\n", sel ? 1 : 0,
+            n, nak, silent, other, (unsigned long)(dt / (uint32_t)n)
+        );
+    }
+
+    _mfcHalt();
+    _mfcAuthed = false;
+    _mfcXcvVerbose = wasVerbose;
+}
+
 bool ST25R3916::_mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB, uint32_t fwtMs) {
+    _mfcLastAuthBits = -1;
+    _mfcLastAuthErr = -1;
     uint64_t k = 0;
     for (int i = 0; i < 6; i++) k = (k << 8) | key[i];
 
@@ -3780,6 +4015,8 @@ bool ST25R3916::_mifareAuth(uint8_t block, const uint8_t key[6], bool useKeyB, u
     uint16_t rxBits = 0;
     _mfcPhase(MFC_PH_AT);
     auto err = _mifareTransceiveRaw(tx, txBits, rx, sizeof(rx), &rxBits, rfalConvMsTo1fc(fwtMs), MFC_FLAGS_ENC, "AT");
+    _mfcLastAuthBits = (int)rxBits;
+    _mfcLastAuthErr = (int)err;
     // Measured AT: 36 bits on success (32 data + 4 parity), 4 bits on NAK.
     // Keep a range because both are valid card responses; timeouts/framing fail _mfcRxOk.
     if (!_mfcRxOk(err) || (rxBits != 36 && rxBits != 4)) {
