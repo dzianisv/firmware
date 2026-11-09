@@ -1,0 +1,148 @@
+name: Build M5Stack Cardputer ADV Firmware
+
+on:
+  push:
+    branches:
+      - feature/mifare-classic-recovery-cardputer-adv
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            python3-pip python3-venv python3-setuptools \
+            git curl wget build-essential cmake ninja-build \
+            libssl-dev libffi-dev libusb-1.0-0-dev \
+            unzip zip
+
+      - name: Test Wi-Fi archive patch safety
+        run: python3 -m unittest discover -s tests -p 'test_wifi_archive_patch.py' -v
+
+      - name: Install PlatformIO
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install platformio
+          pio --version
+
+      - name: Restore PlatformIO cache
+        id: pio-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            .pio/cache
+            .pio/libdeps
+            .pio/buildcache
+          # v3 excludes all caches created by the removed core patch script.
+          key: ${{ runner.os }}-cardputer-pio-v3-${{ hashFiles('platformio.ini', 'boards/**/*.ini', 'patch*.py') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-cardputer-pio-v3-${{ hashFiles('platformio.ini', 'boards/**/*.ini', 'patch*.py') }}-
+
+      - name: Build firmware (m5stack-cardputer-adv)
+        run: pio run -e m5stack-cardputer-adv
+
+      - name: Save PlatformIO cache (including failed builds)
+        if: ${{ always() && !cancelled() && steps.pio-cache.outcome == 'success' && steps.pio-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            .pio/cache
+            .pio/libdeps
+            .pio/buildcache
+          key: ${{ steps.pio-cache.outputs.cache-primary-key }}
+
+      - name: Package firmware as zip
+        id: package
+        run: |
+          # build.py creates a merged image (bootloader + partitions + app).
+          # The raw .pio firmware.bin is app-only and cannot be flashed at 0x0.
+          MERGED_BIN="Bruce-m5stack-cardputer-adv.bin"
+          if [ ! -s "$MERGED_BIN" ]; then
+            echo "Merged firmware not found at $MERGED_BIN"
+            exit 1
+          fi
+          PACKAGE_DIR="$(mktemp -d)"
+          cp "$MERGED_BIN" "$PACKAGE_DIR/firmware.bin"
+          FIRMWARE_SIZE="$(stat -c%s "$PACKAGE_DIR/firmware.bin")"
+          ZIP_NAME="firmware-m5stack-cardputer-adv-${{ github.run_id }}.zip"
+          (
+            cd "$PACKAGE_DIR"
+            sha256sum firmware.bin > SHA256SUMS
+            zip "/tmp/$ZIP_NAME" firmware.bin SHA256SUMS
+          )
+          unzip -t "/tmp/$ZIP_NAME"
+          {
+            echo "zip_path=/tmp/$ZIP_NAME"
+            echo "zip_name=$ZIP_NAME"
+            echo "firmware_size=$FIRMWARE_SIZE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload firmware zip as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-m5stack-cardputer-adv-zip
+          path: ${{ steps.package.outputs.zip_path }}
+          retention-days: 30
+
+      - name: Create GitHub release (main only)
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: firmware-m5stack-cardputer-adv-${{ github.run_id }}
+          name: "M5Stack Cardputer ADV Firmware (${{ github.run_id }})"
+          body: |
+            ## M5Stack Cardputer ADV Firmware
+
+            **Environment:** m5stack-cardputer-adv
+            **Build:** ${{ github.run_id }}
+            **Commit:** ${{ github.sha }}
+            **Size:** ${{ steps.package.outputs.firmware_size }} bytes
+
+            ### Features
+            - ST25R3916B NFC support (I2C Port A)
+            - MIFARE Classic 1K/4K/Mini read + diagnostics
+            - Known-key checks and experimental recovery scaffolding (not a complete darkside implementation)
+            - Hardware behavior has not been validated
+            - MIFARE Classic diagnostic mode with per-block error classification
+            - Partial-read protection (never misrepresented as complete dump)
+
+            ### Installation
+            Flash with `esptool.py` or PlatformIO:
+            ```bash
+            esptool.py --port /dev/ttyUSB0 write_flash 0x0 firmware.bin
+            ```
+          files: ${{ steps.package.outputs.zip_path }}
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Print firmware info
+        run: |
+          echo "Firmware built successfully!"
+          echo "Environment: m5stack-cardputer-adv"
+          echo "Zip: ${{ steps.package.outputs.zip_path }}"
+          echo "Size: ${{ steps.package.outputs.firmware_size }} bytes"

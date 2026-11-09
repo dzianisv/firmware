@@ -66,6 +66,42 @@ uint32_t crypto1_word(Crypto1State *s, uint32_t in, int is_encrypted) {
 
 uint8_t crypto1_filter_bit(const Crypto1State *s) { return (uint8_t)crypto1_filter(s->odd); }
 
+uint8_t crypto1_filter_u32(uint32_t x) { return (uint8_t)crypto1_filter(x); }
+
+uint8_t crypto1_parity32(uint32_t x) { return (uint8_t)crypto1_parity(x); }
+
+uint8_t crypto1_rollback_bit(Crypto1State *s, uint32_t in, int fb) {
+    s->odd &= 0xffffff;
+    uint32_t x = s->odd;
+    s->odd = s->even;
+    s->even = x;
+
+    uint32_t out = s->even & 1u;
+    out ^= LF_POLY_EVEN & (s->even >>= 1);
+    out ^= LF_POLY_ODD & s->odd;
+    out ^= (in != 0) ? 1u : 0u;
+    const uint8_t ret = (uint8_t)crypto1_filter(s->odd);
+    out ^= (uint32_t)ret & (fb != 0 ? 1u : 0u);
+    s->even |= crypto1_parity(out) << 23;
+    return ret;
+}
+
+uint32_t crypto1_rollback_word(Crypto1State *s, uint32_t in, int fb) {
+    uint32_t ret = 0;
+    for (int i = 31; i >= 0; --i)
+        ret |= (uint32_t)crypto1_rollback_bit(s, C1_BEBIT(in, i), fb) << (i ^ 24);
+    return ret;
+}
+
+void crypto1_get_lfsr(const Crypto1State *s, uint64_t *key) {
+    uint64_t v = 0;
+    for (int i = 23; i >= 0; --i) {
+        v = (v << 1) | (uint64_t)C1_BIT(s->odd, i ^ 3);
+        v = (v << 1) | (uint64_t)C1_BIT(s->even, i ^ 3);
+    }
+    *key = v;
+}
+
 static inline uint32_t crypto1_swapendian(uint32_t x) {
     x = (x >> 8 & 0xff00ffu) | ((x & 0xff00ffu) << 8);
     x = (x >> 16) | (x << 16);

@@ -27,6 +27,18 @@ void RFIDMenu::optionsMenu() {
 #endif
     };
 
+    // Read what the card gives up, then sweep only the locked sectors and save
+    // each key as it verifies. Only meaningful on the ST25R3916, which is the
+    // module that has a MIFARE Classic dump and key recovery at all.
+#if !defined(LITE_VERSION) && !defined(REMOVE_RFID_HW_INTERFACE)
+    if (bruceConfigPins.rfidModule == ST25R3916_SPI_MODULE ||
+        bruceConfigPins.rfidModule == ST25R3916_I2C_MODULE) {
+        options.insert(
+            options.begin() + 1, {"Read + recover", [=]() { TagOMatic(TagOMatic::READ_RECOVER_MODE); }}
+        );
+    }
+#endif
+
 #if !defined(REMOVE_RFID_HW_INTERFACE)
     // Emulate NDEF (arm the radio directly with a built NDEF message) only
     // makes sense on modules that can act as a target/card emulator.
