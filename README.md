@@ -1,5 +1,38 @@
 ![Bruce Main Menu](./media/pictures/bruce_banner.jpg)
 
+> ## M5Stack Cardputer ADV + MIFARE Classic key recovery (this fork)
+>
+> This fork carries one feature on top of upstream Bruce: it makes a locked
+> MIFARE Classic 1K/4K **read-only recoverable from the device itself**, on a
+> Cardputer ADV with the ST25R3916 reader. Nothing in this flow writes to the
+> card being examined.
+>
+> **On the device:** `RFID → Read tag`. It reads what it can, and when sectors
+> are still locked it reports how many and what the sweep will cost, then asks
+> before starting. Say OK and it runs the cheapest algorithm per sector — reuse
+> of a known key, nested authentication, single-keystream sweep, darkside —
+> showing the live phase (`2/3 static sweep 41200/77312`). Every verified key is
+> written to `/BruceRFID/mfc_keys/<UID>.txt` immediately, so a reboot turns an
+> hour of work into a read. `ESC` on the offer keeps it read-only; `ESC` during
+> the sweep stops after the current sector and keeps what was found.
+>
+> **Serial commands:** `rfid read`, `rfid recover <ms> <sector>`,
+> `rfid mfckeys [save|load|show]`, `rfid mfcaddkey <12-hex>`, `rfid mfcbench`.
+> `mfckeys show` reports which sectors are known and never prints a key value.
+>
+> **Flash a prebuilt image** (release asset `Bruce-m5stack-cardputer-adv-mfc.bin`):
+>
+> ```sh
+> # 1. back up the whole flash first; keep the file, it is the only way back
+> esptool.py --port /dev/cu.usbmodem1101 read_flash 0x0 0x800000 cardputer-backup-8mb.bin
+> # 2. write the merged image at offset 0 and let it verify
+> esptool.py --port /dev/cu.usbmodem1101 write_flash 0x0 Bruce-m5stack-cardputer-adv-mfc.bin
+> ```
+>
+> Building from source and the device test scripts are in
+> [`scripts/mfc-test/`](./scripts/mfc-test/README.md). Cost model, evidence and
+> what is still unproven: [`docs/MifareClassicKeyRecovery.md`](./docs/MifareClassicKeyRecovery.md).
+
 # :shark: Bruce
 
 Bruce is a versatile ESP32 firmware packed with offensive-security tools, built to make Red Team operations fast and portable.
