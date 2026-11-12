@@ -16,6 +16,15 @@
 > hour of work into a read. `ESC` on the offer keeps it read-only; `ESC` during
 > the sweep stops after the current sector and keeps what was found.
 >
+> **Known issue:** one sweep has frozen in the AT phase and ignored its own abort
+> flag (10,524 candidates in, seen once on 2026-11-08). Keys already recovered are
+> saved and survive a reboot, but the run does not resume itself, so a multi-hour
+> unattended sweep is not yet safe. Details in
+> [`docs/MifareClassicKeyRecovery.md`](./docs/MifareClassicKeyRecovery.md#stalls-and-the-hang-that-is-still-open).
+>
+> **Not verified visually:** the offer and progress screens are confirmed in code
+> and in the serial transcript, not against a photo of the panel.
+>
 > **Serial commands:** `rfid read`, `rfid recover <ms> <sector>`,
 > `rfid mfckeys [save|load|show]`, `rfid mfcaddkey <12-hex>`, `rfid mfcbench`.
 > `mfckeys show` reports which sectors are known and never prints a key value.
