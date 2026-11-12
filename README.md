@@ -29,6 +29,26 @@
 > `rfid mfckeys [save|load|show]`, `rfid mfcaddkey <12-hex>`, `rfid mfcbench`.
 > `mfckeys show` reports which sectors are known and never prints a key value.
 >
+> **Run a recovery from serial** (same code path as the device screen):
+>
+> ```sh
+> rfid read 5000            # what the card gives up right now, prints Pages: N
+> rfid recover 5000 8       # recover sector 8; expect "static -> Verified"
+> rfid read 5000            # Pages should go up
+> rfid mfckeys show         # which sectors are known now
+> ```
+>
+> A locked sector takes 62 to 78 minutes at 17 to 18 candidates a second. A
+> sector that reuses a known key finishes in seconds. Every verified key is
+> saved immediately, so stopping early keeps what was found. Flashing erases
+> those saved keys, because they live on the internal filesystem: copy
+> `/BruceRFID/mfc_keys/<UID>.txt` off the device first, or re-inject them with
+> `rfid mfcaddkey`.
+>
+> The whole loop, including the persistence test and the flash harness, is in
+> the skill `cardputer-firmware` and in
+> [`scripts/mfc-test/`](./scripts/mfc-test/README.md).
+>
 > **Flash a prebuilt image** (release asset `Bruce-m5stack-cardputer-adv-mfc.bin`):
 >
 > ```sh
